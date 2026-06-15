@@ -284,7 +284,7 @@ export default function Home() {
                   className="z-10 h-16 w-16 rounded-full bg-brand-red/10 border border-brand-red/35 flex items-center justify-center group-hover:bg-brand-red group-hover:scale-110 transition-all duration-300 shadow-2xl"
                 >
                   <svg
-                    className="h-6 w-6 text-brand-red group-hover:text-white pl-1 transition-colors"
+                    className="h-6 w-6 text-brand-red group-hover:text-white transition-colors"
                     fill="currentColor"
                     viewBox="0 0 24 24"
                     xmlns="http://www.w3.org/2000/svg"
@@ -347,7 +347,7 @@ export default function Home() {
                   >
                     <div className="h-5 w-5 bg-white text-brand-red rounded-full flex items-center justify-center">
                       <svg
-                        className="h-3 w-3 pl-0.5"
+                        className="h-3 w-3"
                         fill="currentColor"
                         viewBox="0 0 24 24"
                         xmlns="http://www.w3.org/2000/svg"

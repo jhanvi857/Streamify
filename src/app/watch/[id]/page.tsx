@@ -421,7 +421,7 @@ export default function WatchPage() {
                   onClick={() => setIsPlaying(true)}
                   className="z-10 h-16 w-16 rounded-full bg-brand-red hover:bg-brand-red-hover text-white flex items-center justify-center shadow-lg transition-transform hover:scale-110 active:scale-95 duration-200 cursor-pointer"
                 >
-                  <svg className="h-6 w-6 pl-1" fill="currentColor" viewBox="0 0 24 24">
+                  <svg className="h-6 w-6" fill="currentColor" viewBox="0 0 24 24">
                     <path d="M8 5v14l11-7z" />
                   </svg>
                 </button>

@@ -21,7 +21,7 @@ export default function VideoCard({ video }: VideoCardProps) {
         {/* Play Button Icon */}
         <div className="relative z-10 flex h-12 w-12 items-center justify-center rounded-full bg-brand-red/10 border border-brand-red/35 group-hover:bg-brand-red group-hover:scale-110 transition-all duration-300">
           <svg
-            className="h-5 w-5 text-brand-red group-hover:text-white transition-colors pl-0.5"
+            className="h-5 w-5 text-brand-red group-hover:text-white transition-colors"
             fill="currentColor"
             viewBox="0 0 24 24"
             xmlns="http://www.w3.org/2000/svg"
@@ -37,7 +37,7 @@ export default function VideoCard({ video }: VideoCardProps) {
       </div>
 
       {/* Details */}
-      <div className="p-4 flex flex-col justify-between flex-grow">
+      <div className="p-4 flex flex-col justify-between grow">
         <div>
           <div className="flex items-start justify-between gap-2">
             <h3 className="text-sm font-semibold text-gray-100 group-hover:text-white line-clamp-2 transition-colors duration-200 leading-tight">
