@@ -8,62 +8,20 @@ import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
 
-// Dynamic mock videos generated to feed the infinite scroll
-const extraMockVideos = [
-  {
-    title: "How CDN Edge Caching scales to millions of users",
-    author: "Alex Rivera",
-    views: "18.5k views",
-    date: "4 days ago",
-    duration: "15:20",
-    tag: "system design" as const,
-    description: "Learn how CDN cache hit ratios, cache invalidation strategies (purge, ban), and DNS geo-routing work together to distribute high-definition video chunks worldwide.",
-    visibility: "public" as const,
-  },
-  {
-    title: "WebRTC vs HLS: when to choose real-time streaming",
-    author: "Sarah Jenkins",
-    views: "22.1k views",
-    date: "1 week ago",
-    duration: "22:15",
-    tag: "dev talks" as const,
-    description: "A comparison of sub-second latency WebRTC peer-to-peer protocols versus segmented HTTP-based streaming (HLS/DASH). Understand the trade-offs of scale vs. delay.",
-    visibility: "public" as const,
-  },
-  {
-    title: "Building a distributed job scheduler with Kafka and Go",
-    author: "Arjun K.",
-    views: "11.2k views",
-    date: "6 days ago",
-    duration: "34:50",
-    tag: "system design" as const,
-    description: "Deep dive into using Apache Kafka as an event backbone to schedule and scale high-throughput transcoding tasks across multiple containerized worker fleets.",
-    visibility: "public" as const,
-  },
-  {
-    title: "Object Storage deep dive: S3 lifecycle policies and pricing",
-    author: "Elena Petrova",
-    views: "5.4k views",
-    date: "3 weeks ago",
-    duration: "12:10",
-    tag: "tutorials" as const,
-    description: "How to minimize storage bills by automatically tiering raw source videos to Glacier Deep Archive, while keeping HLS files in S3 standard with CDN fronting.",
-    visibility: "public" as const,
-  },
-  {
-    title: "Designing the API Gateway for microservices",
-    author: "Meera V.",
-    views: "14.9k views",
-    date: "10 days ago",
-    duration: "28:30",
-    tag: "design" as const,
-    description: "Exploring rate-limiting, request routing, and payload chunk handling at the Gateway level to protect backend transcoding pools from overload.",
-    visibility: "public" as const,
-  }
-];
+// Dynamic mock videos array (emptied to only show real user / API videos)
+const extraMockVideos: Array<{
+  title: string;
+  author: string;
+  views: string;
+  date: string;
+  duration: string;
+  tag: Video["tag"];
+  description: string;
+  visibility: Video["visibility"];
+}> = [];
 
 export default function Home() {
-  const { videos, isLoaded } = useVideos();
+  const { videos, isLoaded, deleteVideo } = useVideos();
   const [activeTab, setActiveTab] = useState<"feed" | "trending" | "my-uploads">("feed");
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
@@ -406,7 +364,7 @@ export default function Home() {
           ) : (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
               {displayGridList.map((video) => (
-                <VideoCard key={video.id} video={video} />
+                <VideoCard key={video.id} video={video} onDelete={deleteVideo} />
               ))}
             </div>
           )}
