@@ -6,16 +6,33 @@ import Header from "@/components/Header";
 import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
+import { fetchVideoByIdFromApi } from "@/lib/api";
 
 export default function WatchPage() {
   const { id } = useParams();
   const router = useRouter();
-  const { videos, isLoaded } = useVideos();
+  const { videos, isLoaded, deleteVideo } = useVideos();
   const [video, setVideo] = useState<Video | null>(null);
+  const realVideoRef = useRef<HTMLVideoElement>(null);
 
   // Video playback states
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
+  const [realDuration, setRealDuration] = useState<number>(0);
+  const [hoverTime, setHoverTime] = useState<number | null>(null);
+  const [hoverPercent, setHoverPercent] = useState<number>(0);
+
+  const toggleRealPlay = () => {
+    if (realVideoRef.current) {
+      if (isPlaying) {
+        realVideoRef.current.pause();
+      } else {
+        realVideoRef.current.play();
+      }
+    } else {
+      setIsPlaying(!isPlaying);
+    }
+  };
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [qualityMode, setQualityMode] = useState<"Auto" | "1080p" | "720p" | "360p">("Auto");
   const [isBuffering, setIsBuffering] = useState(false);
@@ -53,16 +70,40 @@ export default function WatchPage() {
   const animationRef = useRef<number | null>(null);
   const goJobIdCounter = useRef(1);
 
-  // Load video from DB / LocalStorage
+  // Load video from Backend API or DB / LocalStorage
   useEffect(() => {
-    if (isLoaded) {
-      const found = videos.find((v) => v.id === id);
+    async function loadVideoDetails() {
+      if (!id) return;
+      const targetId = Array.isArray(id) ? id[0] : id;
+
+      // 1. Check local/hook videos list first
+      const found = videos.find((v) => v.id === targetId);
       if (found) {
         setVideo(found);
-      } else {
+        return;
+      }
+
+      // 2. Fetch from Go Backend API
+      const backendVid = await fetchVideoByIdFromApi(targetId);
+      if (backendVid) {
+        setVideo({
+          id: backendVid.id,
+          title: backendVid.title,
+          description: backendVid.description || "",
+          tag: (backendVid.category as Video["tag"]) || "system design",
+          author: backendVid.author_id || "Anonymous",
+          views: `${backendVid.views_count || 0} views`,
+          date: new Date(backendVid.created_at).toLocaleDateString(),
+          duration: backendVid.duration || "03:15",
+          visibility: backendVid.visibility || "public",
+          minioManifestUrl: backendVid.minio_manifest_url,
+        });
+      } else if (isLoaded) {
         setVideo(null);
       }
     }
+
+    loadVideoDetails();
   }, [id, videos, isLoaded]);
 
   // SVG flow ticker
@@ -388,8 +429,9 @@ export default function WatchPage() {
     );
   }
 
-  const videoDurationSec = parseDuration(video.duration);
-  const percentage = (currentTime / videoDurationSec) * 100;
+  const parsedDuration = parseDuration(video.duration);
+  const videoDurationSec = realDuration > 0 ? realDuration : (parsedDuration > 0 ? parsedDuration : 1);
+  const percentage = Math.min(100, Math.max(0, (currentTime / videoDurationSec) * 100));
 
   return (
     <div className="min-h-screen bg-dark-base text-gray-100 flex flex-col pb-20">
@@ -405,44 +447,75 @@ export default function WatchPage() {
             
             {/* Player Canvas Display */}
             <div className="absolute inset-0 flex items-center justify-center bg-neutral-950">
-              {/* Buffer overlay */}
-              {isBuffering && (
-                <div className="absolute inset-0 bg-black/60 z-20 flex flex-col items-center justify-center gap-3">
-                  <div className="h-10 w-10 border-4 border-brand-red border-t-transparent rounded-full animate-spin" />
-                  <span className="text-xs text-gray-200 font-bold uppercase tracking-wider animate-pulse-slow">
-                    Buffering Segment {currentSegment}...
-                  </span>
-                </div>
-              )}
+              {video.minioManifestUrl ? (
+                <video
+                  ref={realVideoRef}
+                  src={video.minioManifestUrl}
+                  autoPlay
+                  className="w-full h-full object-contain cursor-pointer transition-all duration-300"
+                  style={{
+                    filter: activeQuality === "360p"
+                      ? "contrast(0.9) brightness(0.95) blur(0.6px)"
+                      : activeQuality === "720p"
+                      ? "contrast(0.98) blur(0.2px)"
+                      : "none"
+                  }}
+                  onClick={toggleRealPlay}
+                  onPlay={() => setIsPlaying(true)}
+                  onPause={() => setIsPlaying(false)}
+                  onLoadedMetadata={(e) => {
+                    if (e.currentTarget.duration && !isNaN(e.currentTarget.duration)) {
+                      setRealDuration(e.currentTarget.duration);
+                    }
+                  }}
+                  onTimeUpdate={() => {
+                    if (realVideoRef.current) {
+                      setCurrentTime(realVideoRef.current.currentTime);
+                    }
+                  }}
+                />
+              ) : (
+                <>
+                  {/* Buffer overlay */}
+                  {isBuffering && (
+                    <div className="absolute inset-0 bg-black/60 z-20 flex flex-col items-center justify-center gap-3">
+                      <div className="h-10 w-10 border-4 border-brand-red border-t-transparent rounded-full animate-spin" />
+                      <span className="text-xs text-gray-200 font-bold uppercase tracking-wider animate-pulse-slow">
+                        Buffering Segment {currentSegment}...
+                      </span>
+                    </div>
+                  )}
 
-              {/* Play symbol indicator */}
-              {!isPlaying && !isBuffering && (
-                <button
-                  onClick={() => setIsPlaying(true)}
-                  className="z-10 h-16 w-16 rounded-full bg-brand-red hover:bg-brand-red-hover text-white flex items-center justify-center shadow-lg transition-transform hover:scale-110 active:scale-95 duration-200 cursor-pointer"
-                >
-                  <svg className="h-6 w-6" fill="currentColor" viewBox="0 0 24 24">
-                    <path d="M8 5v14l11-7z" />
-                  </svg>
-                </button>
-              )}
+                  {/* Play symbol indicator */}
+                  {!isPlaying && !isBuffering && (
+                    <button
+                      onClick={toggleRealPlay}
+                      className="z-10 h-16 w-16 rounded-full bg-brand-red hover:bg-brand-red-hover text-white flex items-center justify-center shadow-lg transition-transform hover:scale-110 active:scale-95 duration-200 cursor-pointer"
+                    >
+                      <svg className="h-6 w-6" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M8 5v14l11-7z" />
+                      </svg>
+                    </button>
+                  )}
 
-              {/* Simulated visual video stream frame content */}
-              {isPlaying && !isBuffering && (
-                <div className="flex flex-col items-center text-center p-6 gap-2 select-none pointer-events-none">
-                  {/* Rotating visual elements depending on topic */}
-                  <div className="h-14 w-14 rounded-full border-2 border-dashed border-brand-red/40 flex items-center justify-center animate-spin" style={{ animationDuration: "12s" }}>
-                    <svg className="h-6 w-6 text-brand-red" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                    </svg>
-                  </div>
-                  <span className="text-[10px] font-mono text-gray-500 uppercase tracking-widest mt-2">
-                    Streaming Media variant: <span className="text-brand-red font-bold">{activeQuality}</span>
-                  </span>
-                  <span className="text-xs font-semibold text-gray-300">
-                    Segment #{currentSegment} playing...
-                  </span>
-                </div>
+                  {/* Simulated visual video stream frame content */}
+                  {isPlaying && !isBuffering && (
+                    <div className="flex flex-col items-center text-center p-6 gap-2 select-none pointer-events-none">
+                      {/* Rotating visual elements depending on topic */}
+                      <div className="h-14 w-14 rounded-full border-2 border-dashed border-brand-red/40 flex items-center justify-center animate-spin" style={{ animationDuration: "12s" }}>
+                        <svg className="h-6 w-6 text-brand-red" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                        </svg>
+                      </div>
+                      <span className="text-[10px] font-mono text-gray-500 uppercase tracking-widest mt-2">
+                        Streaming Media variant: <span className="text-brand-red font-bold">{activeQuality}</span>
+                      </span>
+                      <span className="text-xs font-semibold text-gray-300">
+                        Segment #{currentSegment} playing...
+                      </span>
+                    </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -463,14 +536,52 @@ export default function WatchPage() {
               </div>
             )}
 
-            {/* Custom control bar */}
-            <div className="absolute bottom-0 inset-x-0 z-20 bg-gradient-to-t from-black/90 to-transparent p-4 opacity-0 group-hover:opacity-100 transition-opacity duration-300 flex flex-col gap-2">
+            {/* Custom control bar (Always visible red progress bar, expandable controls on hover) */}
+            <div className="absolute bottom-0 inset-x-0 z-20 bg-gradient-to-t from-black/95 via-black/75 to-transparent px-4 pb-3 pt-6 flex flex-col gap-2 transition-opacity duration-200">
               
-              {/* Timeline scrubber bar */}
-              <div className="w-full bg-gray-700 h-1 rounded-full cursor-pointer relative overflow-hidden group/timeline">
+              {/* YouTube-authentic Interactive Timeline Scrubber */}
+              <div
+                className="relative w-full h-4 cursor-pointer flex items-center group/scrubber"
+                onMouseMove={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  setHoverPercent(pct * 100);
+                  setHoverTime(pct * videoDurationSec);
+                }}
+                onMouseLeave={() => setHoverTime(null)}
+                onClick={(e) => {
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+                  const targetTime = pct * videoDurationSec;
+                  if (realVideoRef.current && realVideoRef.current.duration) {
+                    realVideoRef.current.currentTime = targetTime;
+                  }
+                  setCurrentTime(targetTime);
+                }}
+              >
+                {/* Hover Time Tooltip Preview */}
+                {hoverTime !== null && (
+                  <div
+                    className="absolute -top-7 transform -translate-x-1/2 bg-black/90 text-white text-[10px] font-mono px-2 py-0.5 rounded border border-gray-700 pointer-events-none shadow z-30"
+                    style={{ left: `${hoverPercent}%` }}
+                  >
+                    {formatTime(hoverTime)}
+                  </div>
+                )}
+
+                {/* Track background */}
+                <div className="w-full bg-gray-600/60 h-1.5 group-hover/scrubber:h-2.5 rounded-full transition-all duration-150 relative overflow-hidden">
+                  {/* YouTube Bright Red Progress Line */}
+                  <div
+                    className="bg-brand-red h-full rounded-full transition-all duration-75 shadow-sm"
+                    style={{ width: `${percentage}%` }}
+                  />
+                </div>
+
+                {/* YouTube Red Scrubber Thumb Handle */}
                 <div
-                  className="bg-brand-red h-full rounded-full transition-all duration-200"
-                  style={{ width: `${percentage}%` }}
+                  className="absolute h-3.5 w-3.5 bg-brand-red border-2 border-white rounded-full shadow-md transform -translate-x-1/2 scale-0 group-hover/scrubber:scale-100 transition-transform duration-150 pointer-events-none"
+                  style={{ left: `${percentage}%` }}
                 />
               </div>
 
@@ -479,7 +590,7 @@ export default function WatchPage() {
                 <div className="flex items-center gap-4">
                   {/* PlayPause */}
                   <button
-                    onClick={() => setIsPlaying(!isPlaying)}
+                    onClick={toggleRealPlay}
                     className="hover:text-brand-red transition-colors cursor-pointer"
                   >
                     {isPlaying ? (
@@ -500,11 +611,16 @@ export default function WatchPage() {
 
                   {/* Timestamp */}
                   <span className="font-mono text-[10px] text-gray-300">
-                    {formatTime(currentTime)} / {video.duration}
+                    {formatTime(currentTime)} / {realDuration > 0 ? formatTime(realDuration) : video.duration}
                   </span>
                 </div>
 
                 <div className="flex items-center gap-4">
+                  {/* Active quality badge */}
+                  <span className="bg-brand-red/10 border border-brand-red/30 text-brand-red text-[9px] font-mono font-bold px-1.5 py-0.5 rounded uppercase">
+                    {activeQuality}
+                  </span>
+
                   {/* Stats for nerds toggle */}
                   <button
                     onClick={() => setStatsForNerds(!statsForNerds)}
@@ -520,13 +636,21 @@ export default function WatchPage() {
                   {/* Quality selector dropdown */}
                   <select
                     value={qualityMode}
-                    onChange={(e) => setQualityMode(e.target.value as any)}
+                    onChange={(e) => {
+                      const mode = e.target.value as any;
+                      setQualityMode(mode);
+                      if (mode === "Auto") {
+                        setActiveQuality("1080p");
+                      } else {
+                        setActiveQuality(mode);
+                      }
+                    }}
                     className="bg-transparent border border-gray-700 text-white text-[10px] rounded px-1.5 py-0.5 outline-none cursor-pointer hover:border-gray-500"
                   >
                     <option value="Auto" className="bg-dark-card text-white">Auto ({activeQuality})</option>
-                    <option value="1080p" className="bg-dark-card text-white">1080p</option>
-                    <option value="720p" className="bg-dark-card text-white">720p</option>
-                    <option value="360p" className="bg-dark-card text-white">360p</option>
+                    <option value="1080p" className="bg-dark-card text-white">1080p (Full HD)</option>
+                    <option value="720p" className="bg-dark-card text-white">720p (HD)</option>
+                    <option value="360p" className="bg-dark-card text-white">360p (SD)</option>
                   </select>
                 </div>
               </div>
@@ -555,6 +679,20 @@ export default function WatchPage() {
                 <span className="mx-2 text-gray-600">•</span>
                 <span>{video.date}</span>
               </div>
+              <button
+                onClick={async () => {
+                  if (confirm(`Are you sure you want to delete "${video.title}"?`)) {
+                    await deleteVideo(video.id);
+                    router.push("/");
+                  }
+                }}
+                className="flex items-center gap-1.5 bg-red-600/10 hover:bg-red-600 text-red-500 hover:text-white border border-red-500/20 px-3 py-1.5 rounded-lg font-semibold transition-all cursor-pointer select-none"
+              >
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+                Delete Video
+              </button>
             </div>
 
             {/* Unlisted Link Sharing section */}
@@ -874,7 +1012,7 @@ export default function WatchPage() {
                       {uploadStatus === "uploading"
                         ? "Uploading chunks..."
                         : uploadStatus === "assembling"
-                        ? "Assembling parts on S3..."
+                        ? "Assembling parts on MinIO..."
                         : "Trigger Resumable Chunked Upload"}
                     </button>
 
