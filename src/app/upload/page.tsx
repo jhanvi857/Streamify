@@ -1,15 +1,25 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Header from "@/components/Header";
 import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
+import { useSession } from "@/lib/auth-client";
+import { initVideoUpload, uploadFileToMinIO, completeVideoUpload } from "@/lib/api";
 
 export default function UploadPage() {
   const router = useRouter();
   const { addVideo } = useVideos();
+  const { data: session, isPending } = useSession();
+
+  // Route protection
+  useEffect(() => {
+    if (!isPending && !session) {
+      router.push("/login");
+    }
+  }, [session, isPending, router]);
 
   // Form states
   const [title, setTitle] = useState("");
@@ -68,8 +78,8 @@ export default function UploadPage() {
     }
   };
 
-  // Run the full ingestion/transcode simulator
-  const startIngestionPipeline = (e: React.FormEvent) => {
+  // Run the full ingestion/transcode pipeline (Backend API + visual feedback fallback)
+  const startIngestionPipeline = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title || !file) return;
 
@@ -81,7 +91,43 @@ export default function UploadPage() {
     setTranscodeProgress({ p360: 0, p720: 0, p1080: 0 });
     setGeneratedManifests([]);
 
-    // Step 1: Chunked Multipart Upload (Duration: ~2.5s)
+    const authorId = session?.user?.id || "anonymous-user";
+
+    // Try Real Backend Upload Session
+    const initRes = await initVideoUpload({
+      title,
+      description,
+      category,
+      visibility,
+      duration,
+      author_id: authorId,
+    });
+
+    if (initRes && initRes.upload_url) {
+      // Direct upload to MinIO S3 Presigned URL
+      const uploadSuccess = await uploadFileToMinIO(
+        initRes.upload_url,
+        file,
+        (percent) => setUploadProgress(percent)
+      );
+
+      if (uploadSuccess) {
+        setUploadProgress(100);
+        // Complete upload and trigger Redis Asynq transcoding task
+        const completeRes = await completeVideoUpload({
+          video_id: initRes.video_id,
+          object_name: initRes.object_name,
+        });
+
+        if (completeRes) {
+          setFinishedVideoId(initRes.video_id);
+          triggerRedisStep();
+          return;
+        }
+      }
+    }
+
+    // Fallback simulation loop if backend is offline or unreachable
     const uploadInterval = setInterval(() => {
       setUploadProgress((prev) => {
         if (prev >= 100) {
@@ -98,13 +144,13 @@ export default function UploadPage() {
   const triggerRedisStep = () => {
     setSimStep("redis");
     const logs = [
-      "SYSTEM: Upload session complete. S3 File HASH: sha256_f8a3d90214e",
-      "API SERVER: Initializing database entry (visibility = " + visibility + ")",
-      "API SERVER: Database record created. State set to 'PENDING_ENCODE'",
-      "REDIS CLIENT: Dispatched LPUSH transcode_job_queue [id: job_" + Math.floor(Math.random() * 900 + 100) + "]",
-      "REDIS CLIENT: Event published to channel 'transcode_events'",
-      "WORKER DAEMON: Redis SUBSCRIBE detected new message",
-      "WORKER DAEMON: Worker node-17 pulled task from queue. Lock acquired via REDLOCK.",
+      "SYSTEM: Upload session complete. MinIO File HASH: sha256_f8a3d90214e",
+      "GO API SERVER: Writing record to PostgreSQL database (status = 'pending')",
+      "GO API SERVER: PostgreSQL row initialized. Preparing Asynq task payload...",
+      "ASYNQ CLIENT: Enqueued task 'video:transcode' to Redis queue 'default'",
+      "ASYNQ CLIENT: Redis task state: asynq:{default}:pending [task_id: " + Math.floor(Math.random() * 900 + 100) + "]",
+      "ASYNQ WORKER: Pulled task 'video:transcode' from queue. Executing handler...",
+      "GO WORKER: Launched FFmpeg processor. Updating PostgreSQL status to 'processing'...",
     ];
 
     let currentLogIndex = 0;
@@ -123,7 +169,7 @@ export default function UploadPage() {
   const triggerFfmpegStep = () => {
     setSimStep("ffmpeg");
     const logs = [
-      "FFMPEG: Input #0, mov,mp4,m4a, from 's3://raw-bucket/temp_file.mp4'",
+      "FFMPEG: Input #0, mov,mp4,m4a, from 'minio://raw-bucket/temp_file.mp4'",
       "FFMPEG:   Duration: 00:03:15.00, start: 0.000000, bitrate: 14210 kb/s",
       "FFMPEG:   Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv), 1920x1080",
       "FFMPEG:   Stream #0:1(und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo",
@@ -176,7 +222,7 @@ export default function UploadPage() {
       "COMPILE: Writing variant stream segment stream_1080p_002.ts",
       "COMPILE: Generated index manifest playlist_1080p.m3u8",
       "COMPILE: Writing master stream index master.m3u8",
-      "COMPILE: HLS master compilation successful. S3 destination layout compiled.",
+      "COMPILE: HLS master compilation successful. MinIO destination layout compiled.",
     ];
 
     let currentIdx = 0;
@@ -195,56 +241,32 @@ export default function UploadPage() {
   const triggerCompleteStep = () => {
     setSimStep("completed");
 
-    // Generate video ID (slug for public, secure unguessable UUID for private link protection)
+    // If real backend upload succeeded, finishedVideoId is already set to real UUID
+    if (finishedVideoId) {
+      return;
+    }
+
+    // Fallback ID generation for local simulation only
     const generatedId = visibility === "private"
       ? crypto.randomUUID()
       : `custom-${title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/(^-|-$)/g, "") || "video"}-${Math.floor(Math.random() * 800 + 100)}`;
     
     setFinishedVideoId(generatedId);
 
-    // Build the new video metadata object
+    // Build the fallback video metadata object
     const newVideo: Video = {
       id: generatedId,
       title: title,
-      author: "JH (You)",
+      author: session?.user?.name ? `${session.user.name} (You)` : "JH (You)",
       views: "0 views",
       date: "Just now",
       duration: duration,
       tag: category,
       description: description || `Uploaded custom course video covering ${title}. Designed to explain components of distributed video engineering.`,
       visibility: visibility,
-      // Custom uploaded videos can link back to related system designs for teaching!
-      systemDesign: {
-        conceptTitle: `Custom Ingested: ${title}`,
-        architectureType: visibility === "private" ? "upload" : "pipeline",
-        summary: `This is a user-uploaded ${visibility} video. It was processed via your custom-simulated FFmpeg and S3 Pipeline.`,
-        diagramData: {
-          nodes: [
-            { id: "client", label: "Client Browser", x: 10, y: 50, type: "client" },
-            { id: "gateway", label: "API Gateway", x: 30, y: 50, type: "gateway" },
-            { id: "s3_raw", label: "S3 Storage", x: 60, y: 30, type: "storage" },
-            { id: "redis", label: "Redis Queue", x: 60, y: 70, type: "queue" },
-            { id: "workers", label: "FFmpeg Fleet", x: 90, y: 50, type: "worker" }
-          ],
-          connections: [
-            { from: "client", to: "gateway", label: "Upload Chunks" },
-            { from: "gateway", to: "s3_raw", label: "Push S3" },
-            { from: "gateway", to: "redis", label: "Enqueue Job" },
-            { from: "redis", to: "workers", label: "Execute FFmpeg" }
-          ]
-        },
-        details: [
-          {
-            title: "Access Rights & Security",
-            text: visibility === "private" 
-              ? "This video is Private. It is guarded by unguessable UUID paths, protecting against Direct Object Reference vulnerability. To serve S3 files, edge node checks session headers and crafts short-live S3 pre-signed URLs."
-              : "This video is Public. It is indexed in the home search feed. Media playlist manifests are aggressively cached at Cloudflare Edge CDNs, reducing S3 egress traffic costs."
-          }
-        ]
-      }
     };
 
-    // Save to hooks list (LocalStorage)
+    // Save to local storage only if offline/simulation fallback
     addVideo(newVideo);
   };
 
@@ -256,6 +278,19 @@ export default function UploadPage() {
       router.push("/");
     }
   };
+
+  if (isPending) {
+    return (
+      <div className="min-h-screen bg-dark-base text-gray-100 flex flex-col items-center justify-center">
+        <div className="h-8 w-8 border-4 border-brand-red border-t-transparent rounded-full animate-spin" />
+        <span className="mt-4 text-xs font-semibold text-gray-400">Verifying session...</span>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return null;
+  }
 
   return (
     <div className="min-h-screen bg-dark-base text-gray-100 flex flex-col pb-20">
@@ -492,7 +527,7 @@ export default function UploadPage() {
               }`}>
                 <div>
                   <span className="text-[9px] font-bold text-gray-500 uppercase">Step 1</span>
-                  <h3 className="text-xs font-bold text-gray-200 mt-0.5">S3 Chunked Upload</h3>
+                  <h3 className="text-xs font-bold text-gray-200 mt-0.5">MinIO Chunk Ingest</h3>
                 </div>
                 {simStep === "upload" ? (
                   <div className="flex flex-col gap-1.5">
@@ -512,13 +547,13 @@ export default function UploadPage() {
               <div className={`p-4 border rounded-xl flex flex-col justify-between h-[130px] transition-colors ${
                 simStep === "redis" 
                   ? "border-orange-500 bg-orange-500/5"
-                  : simStep !== "upload" && simStep !== "redis"
+                  : simStep !== "upload"
                   ? "border-emerald-500/30 bg-emerald-500/5"
                   : "border-dark-border bg-neutral-900/20 opacity-40"
               }`}>
                 <div>
                   <span className="text-[9px] font-bold text-gray-500 uppercase">Step 2</span>
-                  <h3 className="text-xs font-bold text-gray-200 mt-0.5">Redis Queueing</h3>
+                  <h3 className="text-xs font-bold text-gray-200 mt-0.5">Redis (Asynq)</h3>
                 </div>
                 {simStep === "redis" ? (
                   <span className="text-[9.5px] font-bold text-orange-400 animate-pulse uppercase tracking-wider">Enqueueing job...</span>
@@ -599,7 +634,7 @@ export default function UploadPage() {
                     {uploadProgress > 50 && <div>[API] Sending chunk #3: MD5 hash: 01c23a... ✓ Verified</div>}
                     {uploadProgress > 70 && <div>[API] Sending chunk #4: MD5 hash: b8d3f1... ✓ Verified</div>}
                     {uploadProgress > 90 && <div>[API] Sending chunk #5: MD5 hash: e3c8a9... ✓ Verified</div>}
-                    {uploadProgress >= 100 && <div className="text-emerald-400">[S3] Multipart session assembly initiated...</div>}
+                    {uploadProgress >= 100 && <div className="text-emerald-400">[MinIO] Multipart session assembly initiated...</div>}
                   </div>
                 )}
 
@@ -629,7 +664,7 @@ export default function UploadPage() {
                   <div className="flex flex-col gap-2">
                     <div className="text-emerald-400 font-bold">✓ PIPELINE INGESTION COMPLETED SUCCESSFULLY</div>
                     <div className="text-gray-400 leading-normal">
-                      Master Playlist URI: <span className="text-white border-b border-dark-border pb-0.5">s3://streamify-storage/hls/${finishedVideoId}/master.m3u8</span>
+                      Master Playlist URI: <span className="text-white border-b border-dark-border pb-0.5">minio://streamify-storage/hls/${finishedVideoId}/master.m3u8</span>
                       <br />Visibility State: <span className="text-white uppercase font-bold">{visibility}</span>
                       <br />Direct Stream URL: <span className="text-white border-b border-dark-border pb-0.5">/watch/${finishedVideoId}</span>
                     </div>
