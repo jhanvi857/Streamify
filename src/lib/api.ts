@@ -171,3 +171,28 @@ export async function completeVideoUpload(payload: CompleteUploadRequest): Promi
     return null;
   }
 }
+
+export interface TranscodeStatusResponse {
+  video_id: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  progress: number;
+  error_message?: string;
+  minio_manifest_url?: string;
+}
+
+/**
+ * Fetch real-time transcoding job status from backend PostgreSQL worker pipeline
+ */
+export async function fetchTranscodeStatus(videoId: string): Promise<TranscodeStatusResponse | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/videos/${videoId}/status`, {
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (error) {
+    console.warn(`Failed to fetch transcode status for video ${videoId}:`, error);
+    return null;
+  }
+}
+
