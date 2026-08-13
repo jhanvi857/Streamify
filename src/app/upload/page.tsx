@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
 import { useSession } from "@/lib/auth-client";
-import { initVideoUpload, uploadFileToMinIO, completeVideoUpload } from "@/lib/api";
+import { initVideoUpload, uploadFileToMinIO, completeVideoUpload, fetchTranscodeStatus } from "@/lib/api";
 
 export default function UploadPage() {
   const router = useRouter();
@@ -35,6 +35,7 @@ export default function UploadPage() {
   // Simulation states
   const [isSimulating, setIsSimulating] = useState(false);
   const [simStep, setSimStep] = useState<"upload" | "redis" | "ffmpeg" | "manifest" | "completed">("upload");
+  const [uploadError, setUploadError] = useState<string | null>(null);
   
   // Pipeline details
   const [uploadProgress, setUploadProgress] = useState(0);
@@ -45,6 +46,34 @@ export default function UploadPage() {
   
   // Complete video configuration
   const [finishedVideoId, setFinishedVideoId] = useState("");
+
+  // Extract actual media duration from chosen video file
+  const extractVideoDuration = (videoFile: File) => {
+    try {
+      const tempVideo = document.createElement("video");
+      tempVideo.preload = "metadata";
+      tempVideo.onloadedmetadata = () => {
+        window.URL.revokeObjectURL(tempVideo.src);
+        const totalSec = Math.floor(tempVideo.duration);
+        if (isNaN(totalSec) || !isFinite(totalSec)) return;
+
+        const hrs = Math.floor(totalSec / 3600);
+        const mins = Math.floor((totalSec % 3600) / 60);
+        const secs = totalSec % 60;
+
+        let formatted = "";
+        if (hrs > 0) {
+          formatted = `${hrs}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+        } else {
+          formatted = `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+        }
+        setDuration(formatted);
+      };
+      tempVideo.src = URL.createObjectURL(videoFile);
+    } catch (err) {
+      console.warn("Could not calculate video duration:", err);
+    }
+  };
 
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
@@ -59,10 +88,12 @@ export default function UploadPage() {
     e.preventDefault();
     setIsDragging(false);
     if (e.dataTransfer.files && e.dataTransfer.files[0]) {
-      setFile(e.dataTransfer.files[0]);
+      const selected = e.dataTransfer.files[0];
+      setFile(selected);
+      extractVideoDuration(selected);
       // Auto-set title if empty
       if (!title) {
-        const nameWithoutExt = e.dataTransfer.files[0].name.replace(/\.[^/.]+$/, "");
+        const nameWithoutExt = selected.name.replace(/\.[^/.]+$/, "");
         setTitle(nameWithoutExt);
       }
     }
@@ -70,15 +101,17 @@ export default function UploadPage() {
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
-      setFile(e.target.files[0]);
+      const selected = e.target.files[0];
+      setFile(selected);
+      extractVideoDuration(selected);
       if (!title) {
-        const nameWithoutExt = e.target.files[0].name.replace(/\.[^/.]+$/, "");
+        const nameWithoutExt = selected.name.replace(/\.[^/.]+$/, "");
         setTitle(nameWithoutExt);
       }
     }
   };
 
-  // Run the full ingestion/transcode pipeline (Backend API + visual feedback fallback)
+  // Run the full ingestion/transcode pipeline (Real Go API + Worker polling, with simulator fallback)
   const startIngestionPipeline = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!title || !file) return;
@@ -86,6 +119,7 @@ export default function UploadPage() {
     setIsSimulating(true);
     setSimStep("upload");
     setUploadProgress(0);
+    setUploadError(null);
     setRedisLogs([]);
     setFfmpegLogs([]);
     setTranscodeProgress({ p360: 0, p720: 0, p1080: 0 });
@@ -93,7 +127,7 @@ export default function UploadPage() {
 
     const authorId = session?.user?.id || "anonymous-user";
 
-    // Try Real Backend Upload Session
+    // Step 1: Initialize Upload in Go API & MinIO
     const initRes = await initVideoUpload({
       title,
       description,
@@ -104,30 +138,40 @@ export default function UploadPage() {
     });
 
     if (initRes && initRes.upload_url) {
-      // Direct upload to MinIO S3 Presigned URL
+      setFinishedVideoId(initRes.video_id);
+
+      // Step 2: Upload File to MinIO S3 Presigned URL
       const uploadSuccess = await uploadFileToMinIO(
         initRes.upload_url,
         file,
         (percent) => setUploadProgress(percent)
       );
 
-      if (uploadSuccess) {
-        setUploadProgress(100);
-        // Complete upload and trigger Redis Asynq transcoding task
-        const completeRes = await completeVideoUpload({
-          video_id: initRes.video_id,
-          object_name: initRes.object_name,
-        });
-
-        if (completeRes) {
-          setFinishedVideoId(initRes.video_id);
-          triggerRedisStep();
-          return;
-        }
+      if (!uploadSuccess) {
+        setUploadError("MinIO Upload Failure: Could not upload file binary to Object Storage raw bucket.");
+        return;
       }
+
+      setUploadProgress(100);
+
+      // Step 3: Complete upload and enqueue task in Redis / Asynq
+      const completeRes = await completeVideoUpload({
+        video_id: initRes.video_id,
+        object_name: initRes.object_name,
+      });
+
+      if (!completeRes) {
+        setUploadError("Backend API Error: Failed to finalize upload session or enqueue task in Redis.");
+        return;
+      }
+
+      // Step 4: Start polling real Go Worker transcode job status
+      startRealTranscodePolling(initRes.video_id);
+      return;
     }
 
-    // Fallback simulation loop if backend is offline or unreachable
+    // Fallback simulation loop if Go Backend API is offline
+    setRedisLogs(["NOTICE: Backend API offline. Running local visual simulator..."]);
     const uploadInterval = setInterval(() => {
       setUploadProgress((prev) => {
         if (prev >= 100) {
@@ -140,7 +184,60 @@ export default function UploadPage() {
     }, 150);
   };
 
-  // Step 2: Redis Message Enqueueing (Duration: ~2s)
+  // Real Transcode Status Poller
+  const startRealTranscodePolling = (videoId: string) => {
+    setSimStep("redis");
+    setRedisLogs([
+      "GO API SERVER: File upload finalized. Writing PostgreSQL row (status = 'pending')...",
+      `ASYNQ CLIENT: Task 'video:transcode' enqueued to Redis queue 'default' [video_id: ${videoId}]`,
+    ]);
+
+    const pollInterval = setInterval(async () => {
+      const statusRes = await fetchTranscodeStatus(videoId);
+      if (!statusRes) return;
+
+      if (statusRes.status === "failed") {
+        clearInterval(pollInterval);
+        setUploadError(`Transcoding Worker Failure: ${statusRes.error_message || "FFmpeg job failed in Go worker daemon."}`);
+        return;
+      }
+
+      if (statusRes.status === "processing") {
+        setSimStep("ffmpeg");
+        const prog = statusRes.progress;
+        setTranscodeProgress({
+          p360: Math.min(prog * 1.2, 100),
+          p720: Math.min(prog, 100),
+          p1080: Math.min(prog * 0.8, 100),
+        });
+
+        setFfmpegLogs((prev) => {
+          const logMsg = `GO WORKER: Transcoding active... PostgreSQL job progress: ${prog}%`;
+          if (prev.includes(logMsg)) return prev;
+          return [
+            ...prev,
+            logMsg,
+          ];
+        });
+      }
+
+      if (statusRes.status === "completed" || statusRes.progress >= 100) {
+        clearInterval(pollInterval);
+        setSimStep("manifest");
+        setGeneratedManifests([
+          "COMPILE: HLS master playlist and video segments built.",
+          "COMPILE: Uploaded HLS playlists & TS chunks to MinIO destination bucket.",
+          `HLS URL: ${statusRes.minio_manifest_url || "MinIO HLS Stream Ready"}`,
+        ]);
+
+        setTimeout(() => {
+          setSimStep("completed");
+        }, 1000);
+      }
+    }, 1500);
+  };
+
+  // Step 2 Fallback: Redis Message Enqueueing
   const triggerRedisStep = () => {
     setSimStep("redis");
     const logs = [
@@ -165,7 +262,7 @@ export default function UploadPage() {
     }, 300);
   };
 
-  // Step 3: FFmpeg Multi-Resolution Transcoding (Duration: ~4s)
+  // Step 3 Fallback: FFmpeg Multi-Resolution Transcoding
   const triggerFfmpegStep = () => {
     setSimStep("ffmpeg");
     const logs = [
@@ -504,15 +601,33 @@ export default function UploadPage() {
             {/* Simulation Steps Ticker */}
             <div className="flex items-center justify-between border-b border-dark-border/80 pb-4">
               <h2 className="text-sm font-bold text-white uppercase tracking-wider">
-                Ingestion Queue Sim
+                Ingestion Queue Status
               </h2>
               <div className="flex items-center gap-1.5">
-                <span className={`h-2.5 w-2.5 rounded-full ${simStep === "completed" ? "bg-emerald-500 animate-pulse" : "bg-brand-red animate-ping"}`} />
+                <span className={`h-2.5 w-2.5 rounded-full ${uploadError ? "bg-red-500" : simStep === "completed" ? "bg-emerald-500 animate-pulse" : "bg-brand-red animate-ping"}`} />
                 <span className="text-[10px] font-bold font-mono text-gray-400 capitalize">
-                  Status: {simStep === "completed" ? "Completed" : `${simStep} processing...`}
+                  Status: {uploadError ? "Failed" : simStep === "completed" ? "Completed" : `${simStep} processing...`}
                 </span>
               </div>
             </div>
+
+            {uploadError && (
+              <div className="bg-red-950/80 border border-red-500/50 rounded-xl p-4 flex flex-col gap-2 text-red-200 text-xs font-mono">
+                <div className="flex items-center gap-2 text-red-400 font-bold">
+                  <svg className="w-5 h-5 text-brand-red flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                  </svg>
+                  BACKEND INGESTION ERROR DETECTED
+                </div>
+                <p className="leading-relaxed">{uploadError}</p>
+                <button
+                  onClick={() => { setIsSimulating(false); setUploadError(null); }}
+                  className="mt-2 self-start px-3.5 py-1.5 bg-brand-red/40 hover:bg-brand-red/70 border border-brand-red/60 text-white text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                >
+                  ← Return to Upload Form
+                </button>
+              </div>
+            )}
 
             {/* PIPELINE GRID STATUS */}
             <div className="grid grid-cols-1 md:grid-cols-4 gap-4">

@@ -14,13 +14,15 @@ export default function WatchPage() {
   const { videos, isLoaded, deleteVideo } = useVideos();
   const [video, setVideo] = useState<Video | null>(null);
   const realVideoRef = useRef<HTMLVideoElement>(null);
+  const playerContainerRef = useRef<HTMLDivElement>(null);
 
-  // Video playback states
+  // Video playback & Fullscreen states
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(0);
   const [realDuration, setRealDuration] = useState<number>(0);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [hoverPercent, setHoverPercent] = useState<number>(0);
+  const [isFullscreen, setIsFullscreen] = useState(false);
 
   const toggleRealPlay = () => {
     if (realVideoRef.current) {
@@ -33,6 +35,58 @@ export default function WatchPage() {
       setIsPlaying(!isPlaying);
     }
   };
+
+  const toggleFullscreen = () => {
+    if (!playerContainerRef.current) return;
+
+    if (!document.fullscreenElement) {
+      if (playerContainerRef.current.requestFullscreen) {
+        playerContainerRef.current.requestFullscreen();
+      } else if ((playerContainerRef.current as any).webkitRequestFullscreen) {
+        (playerContainerRef.current as any).webkitRequestFullscreen();
+      } else if ((playerContainerRef.current as any).msRequestFullscreen) {
+        (playerContainerRef.current as any).msRequestFullscreen();
+      }
+    } else {
+      if (document.exitFullscreen) {
+        document.exitFullscreen();
+      } else if ((document as any).webkitExitFullscreen) {
+        (document as any).webkitExitFullscreen();
+      } else if ((document as any).msExitFullscreen) {
+        (document as any).msExitFullscreen();
+      }
+    }
+  };
+
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      setIsFullscreen(!!document.fullscreenElement);
+    };
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+    return () => {
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
+      if (e.key === "f" || e.key === "F") {
+        e.preventDefault();
+        toggleFullscreen();
+      } else if (e.key === " " || e.key === "k" || e.key === "K") {
+        e.preventDefault();
+        toggleRealPlay();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [isPlaying]);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [qualityMode, setQualityMode] = useState<"Auto" | "1080p" | "720p" | "360p">("Auto");
   const [isBuffering, setIsBuffering] = useState(false);
@@ -94,7 +148,7 @@ export default function WatchPage() {
           author: backendVid.author_id || "Anonymous",
           views: `${backendVid.views_count || 0} views`,
           date: new Date(backendVid.created_at).toLocaleDateString(),
-          duration: backendVid.duration || "03:15",
+          duration: backendVid.duration || "00:00",
           visibility: backendVid.visibility || "public",
           minioManifestUrl: backendVid.minio_manifest_url,
         });
@@ -443,7 +497,7 @@ export default function WatchPage() {
         <section className="lg:col-span-7 flex flex-col gap-4">
           
           {/* Mock Video Player container */}
-          <div className="relative aspect-video w-full bg-black rounded-2xl overflow-hidden border border-dark-border group">
+          <div ref={playerContainerRef} className="relative aspect-video w-full bg-black rounded-2xl overflow-hidden border border-dark-border group">
             
             {/* Player Canvas Display */}
             <div className="absolute inset-0 flex items-center justify-center bg-neutral-950">
@@ -652,6 +706,23 @@ export default function WatchPage() {
                     <option value="720p" className="bg-dark-card text-white">720p (HD)</option>
                     <option value="360p" className="bg-dark-card text-white">360p (SD)</option>
                   </select>
+
+                  {/* Fullscreen Button */}
+                  <button
+                    onClick={toggleFullscreen}
+                    title={isFullscreen ? "Exit full screen (f)" : "Full screen (f)"}
+                    className="p-1 text-gray-300 hover:text-brand-red transition-colors cursor-pointer"
+                  >
+                    {isFullscreen ? (
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 9L4 4m0 0l5 0m-5 0l0 5m6 6l5 5m0 0l-5 0m5 0l0-5M9 15l-5 5m0 0l5 0m-5 0l0-5m15-6l-5-5m0 0l5 0m-5 0l0 5" />
+                      </svg>
+                    ) : (
+                      <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                      </svg>
+                    )}
+                  </button>
                 </div>
               </div>
 

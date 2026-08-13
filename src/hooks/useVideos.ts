@@ -23,7 +23,7 @@ export function useVideos() {
           author: bv.author_name || "Anonymous",
           views: `${bv.views_count || 0} views`,
           date: new Date(bv.created_at).toLocaleDateString(),
-          duration: bv.duration || "03:15",
+          duration: bv.duration || "00:00",
           visibility: bv.visibility || "public",
           minioManifestUrl: bv.minio_manifest_url,
         }));

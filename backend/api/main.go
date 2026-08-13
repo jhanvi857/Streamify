@@ -120,6 +120,7 @@ func main() {
 		api.POST("/videos/upload/complete", app.handleCompleteUpload)
 		api.GET("/videos", app.handleListVideos)
 		api.GET("/videos/:id", app.handleGetVideo)
+		api.GET("/videos/:id/status", app.handleGetVideoStatus)
 		api.DELETE("/videos/:id", app.handleDeleteVideo)
 	}
 
@@ -354,20 +355,40 @@ func (app *App) handleDeleteVideo(c *gin.Context) {
 
 	log.Printf("Successfully deleted video %s from PostgreSQL database (rows affected: %d)", id, rowsAffected)
 
-	// 3. Best-effort background cleanup of raw files in MinIO Object Storage
+	// 3. Background cleanup of all storage assets in MinIO (Raw uploads + HLS streams & playlists)
 	go func(vid string) {
 		ctx := context.Background()
+
+		// A. Remove raw upload object from raw-uploads bucket
 		rawObjectName := fmt.Sprintf("raw-%s.mp4", vid)
 		err := app.MinIOClient.RemoveObject(ctx, app.Cfg.RawBucket, rawObjectName, minio.RemoveObjectOptions{})
 		if err != nil {
-			log.Printf("MinIO Cleanup Warning for %s: %v", rawObjectName, err)
+			log.Printf("MinIO Raw Cleanup Warning for %s: %v", rawObjectName, err)
 		} else {
-			log.Printf("MinIO object %s cleaned up successfully", rawObjectName)
+			log.Printf("MinIO raw object %s cleaned up successfully", rawObjectName)
+		}
+
+		// B. Remove all HLS streams, master playlists, and TS segments under prefix vid/
+		opts := minio.ListObjectsOptions{
+			Prefix:    fmt.Sprintf("%s/", vid),
+			Recursive: true,
+		}
+		for obj := range app.MinIOClient.ListObjects(ctx, app.Cfg.HLSBucket, opts) {
+			if obj.Err != nil {
+				log.Printf("MinIO List HLS Object Error for %s: %v", obj.Key, obj.Err)
+				continue
+			}
+			err := app.MinIOClient.RemoveObject(ctx, app.Cfg.HLSBucket, obj.Key, minio.RemoveObjectOptions{})
+			if err != nil {
+				log.Printf("MinIO Remove HLS Object Warning for %s: %v", obj.Key, err)
+			} else {
+				log.Printf("MinIO HLS object %s cleaned up successfully", obj.Key)
+			}
 		}
 	}(id)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Video permanently deleted from PostgreSQL database and storage",
+		"message": "Video permanently deleted from PostgreSQL database and MinIO object storage",
 		"id":      id,
 	})
 }
@@ -377,6 +398,58 @@ func getEnv(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// handleGetVideoStatus checks transcode status and progress for a video
+func (app *App) handleGetVideoStatus(c *gin.Context) {
+	id := c.Param("id")
+
+	var status string
+	var progress int
+	var errorMsg sql.NullString
+	var manifestUrl sql.NullString
+
+	query := `
+		SELECT j.status, j.progress, j.error_message, v.minio_manifest_url
+		FROM transcode_jobs j
+		JOIN videos v ON j.video_id = v.id
+		WHERE j.video_id = $1
+		ORDER BY j.created_at DESC
+		LIMIT 1
+	`
+	err := app.DB.QueryRow(query, id).Scan(&status, &progress, &errorMsg, &manifestUrl)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			var exists bool
+			_ = app.DB.QueryRow("SELECT EXISTS(SELECT 1 FROM videos WHERE id=$1)", id).Scan(&exists)
+			if exists {
+				c.JSON(http.StatusOK, gin.H{
+					"video_id": id,
+					"status":   "pending",
+					"progress": 0,
+				})
+				return
+			}
+			c.JSON(http.StatusNotFound, gin.H{"error": "Video status not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+
+	resp := gin.H{
+		"video_id": id,
+		"status":   status,
+		"progress": progress,
+	}
+	if errorMsg.Valid {
+		resp["error_message"] = errorMsg.String
+	}
+	if manifestUrl.Valid {
+		resp["minio_manifest_url"] = manifestUrl.String
+	}
+
+	c.JSON(http.StatusOK, resp)
 }
 
 func ensureBucketsExist(minioClient *minio.Client, buckets ...string) {
