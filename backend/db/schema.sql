@@ -55,11 +55,22 @@ CREATE TABLE IF NOT EXISTS videos (
     category VARCHAR(50) NOT NULL,
     visibility VARCHAR(20) NOT NULL CHECK (visibility IN ('public', 'private')),
     author_id TEXT REFERENCES "user"(id) ON DELETE SET NULL, -- References Better Auth "user" UUID
-    minio_manifest_url VARCHAR(512), -- Storage URL pointing to raw video or HLS master.m3u8 (CloudWeave / Neon / S3)
+    manifest_url VARCHAR(512), -- Storage URL pointing to raw video or HLS master.m3u8 (CloudWeave / Neon / S3)
     duration VARCHAR(20) DEFAULT '00:00',
     views_count INTEGER DEFAULT 0,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Idempotent column migration if upgrading from previous schema
+DO $$ 
+BEGIN 
+    IF EXISTS (
+        SELECT 1 FROM information_schema.columns 
+        WHERE table_name = 'videos' AND column_name = 'minio_manifest_url'
+    ) THEN 
+        ALTER TABLE videos RENAME COLUMN minio_manifest_url TO manifest_url; 
+    END IF; 
+END $$;
 
 -- Transcoding Jobs Table (Tracks Redis/Asynq tasks in SQL)
 CREATE TABLE IF NOT EXISTS transcode_jobs (
