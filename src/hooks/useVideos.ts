@@ -15,7 +15,7 @@ export function useVideos() {
       // 1. Fetch real videos from Go Backend API
       const backendVideos = await fetchVideosFromApi();
       if (backendVideos && backendVideos.length > 0) {
-        const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api";
+        const apiBaseUrl = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api").replace(/\/+$/, "");
         const loaded: Video[] = backendVideos.map((bv: BackendVideo) => {
           const rawUrl = bv.manifest_url;
           const streamUrl = rawUrl

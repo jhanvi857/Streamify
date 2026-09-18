@@ -217,7 +217,7 @@ export default function WatchPage() {
       if (backendVid) {
         const streamRaw = backendVid.manifest_url;
         const streamFull = streamRaw
-          ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api"}/videos/${backendVid.id}/stream${
+          ? `${(process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api").replace(/\/+$/, "")}/videos/${backendVid.id}/stream${
               streamRaw.includes("master.m3u8") || streamRaw.startsWith("hls/")
                 ? "/master.m3u8"
                 : ""

@@ -211,23 +211,36 @@ func main() {
 			"storage_endpoint": cfg.S3Endpoint,
 		})
 	}
+
+	// Root health ping
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"service":  "Streamify API",
+			"status":   "online",
+			"database": "connected",
+		})
+	})
 	r.GET("/health", healthHandler)
 
-	api := r.Group("/api")
-	{
-		api.GET("/health", healthHandler)
-		api.POST("/videos/upload/init", app.handleInitUpload)
-		api.POST("/videos/upload/direct", app.handleDirectUpload)
-		api.POST("/videos/upload/complete", app.handleCompleteUpload)
-		api.GET("/videos", app.handleListVideos)
-		api.GET("/videos/:id", app.handleGetVideo)
-		api.GET("/videos/:id/stream", app.handleStreamVideo)
-		api.GET("/videos/:id/stream/*filepath", app.handleStreamVideo)
-		api.HEAD("/videos/:id/stream", app.handleStreamVideo)
-		api.HEAD("/videos/:id/stream/*filepath", app.handleStreamVideo)
-		api.GET("/videos/:id/status", app.handleGetVideoStatus)
-		api.DELETE("/videos/:id", app.handleDeleteVideo)
+	// Register video routes on both "/api" and root "" so requests succeed
+	// whether NEXT_PUBLIC_API_URL ends in /api or not
+	registerVideoRoutes := func(rg *gin.RouterGroup) {
+		rg.GET("/health", healthHandler)
+		rg.POST("/videos/upload/init", app.handleInitUpload)
+		rg.POST("/videos/upload/direct", app.handleDirectUpload)
+		rg.POST("/videos/upload/complete", app.handleCompleteUpload)
+		rg.GET("/videos", app.handleListVideos)
+		rg.GET("/videos/:id", app.handleGetVideo)
+		rg.GET("/videos/:id/stream", app.handleStreamVideo)
+		rg.GET("/videos/:id/stream/*filepath", app.handleStreamVideo)
+		rg.HEAD("/videos/:id/stream", app.handleStreamVideo)
+		rg.HEAD("/videos/:id/stream/*filepath", app.handleStreamVideo)
+		rg.GET("/videos/:id/status", app.handleGetVideoStatus)
+		rg.DELETE("/videos/:id", app.handleDeleteVideo)
 	}
+
+	registerVideoRoutes(r.Group("/api"))
+	registerVideoRoutes(r.Group(""))
 
 	log.Printf("Server listening on port %s", cfg.Port)
 	if err := r.Run(":" + cfg.Port); err != nil {
