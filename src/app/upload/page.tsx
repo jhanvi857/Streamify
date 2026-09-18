@@ -193,9 +193,17 @@ export default function UploadPage() {
       `ASYNQ CLIENT: Task 'video:transcode' enqueued to Redis queue 'default' [video_id: ${videoId}]`,
     ]);
 
+    let failCount = 0;
     const pollInterval = setInterval(async () => {
       const statusRes = await fetchTranscodeStatus(videoId);
-      if (!statusRes) return;
+      if (!statusRes) {
+        failCount++;
+        if (failCount > 10) {
+          clearInterval(pollInterval);
+        }
+        return;
+      }
+      failCount = 0;
 
       if (statusRes.status === "failed") {
         clearInterval(pollInterval);

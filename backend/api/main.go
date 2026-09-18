@@ -582,8 +582,8 @@ func (app *App) handleDeleteVideo(c *gin.Context) {
 
 	rowsAffected, _ := res.RowsAffected()
 	if rowsAffected == 0 {
-		log.Printf("Delete target video %s not found in PostgreSQL database", id)
-		c.JSON(http.StatusNotFound, gin.H{"error": "Video record not found in database"})
+		log.Printf("Delete target video %s not found in database (already deleted or local mock)", id)
+		c.JSON(http.StatusOK, gin.H{"message": "Video record already removed or not found in database"})
 		return
 	}
 
@@ -927,7 +927,10 @@ func (app *App) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 			"UPDATE videos SET manifest_url=$1 WHERE id=$2", 
 			rawVideoUrl, payload.VideoID,
 		)
-		app.updateJobProgress(payload.VideoID, 100)
+		_, _ = app.DB.Exec(
+			"UPDATE transcode_jobs SET status='completed', progress=100, updated_at=NOW() WHERE video_id=$1", 
+			payload.VideoID,
+		)
 		log.Printf("[%s] Transcoding fallback complete. Linked raw video URL: %s", payload.VideoID, rawVideoUrl)
 		return nil
 	}
