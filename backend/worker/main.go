@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/hibiken/asynq"
 	_ "github.com/lib/pq"
@@ -44,13 +47,14 @@ type Worker struct {
 }
 
 func main() {
+	rawEndpoint := getEnv("CLOUDWEAVE_ENDPOINT", getEnv("S3_ENDPOINT", getEnv("MINIO_ENDPOINT", "127.0.0.1:9000")))
 	cfg := Config{
 		DBConn:        getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
 		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		MinIOEndpoint: getEnv("MINIO_ENDPOINT", "127.0.0.1:9000"),
-		MinIOKey:      getEnv("MINIO_ROOT_USER", "minioadmin"),
-		MinIOSecret:   getEnv("MINIO_ROOT_PASSWORD", "minioadmin"),
-		RawBucket:     getEnv("MINIO_RAW_BUCKET", "raw-uploads"),
+		MinIOEndpoint: cleanEndpoint(rawEndpoint),
+		MinIOKey:      getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_ACCESS_KEY", getEnv("MINIO_ROOT_USER", "cw_key_streamify"))),
+		MinIOSecret:   getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_SECRET_KEY", getEnv("MINIO_ROOT_PASSWORD", "cw_key_streamify"))),
+		RawBucket:     getEnv("MINIO_RAW_BUCKET", getEnv("S3_BUCKET", "raw-uploads")),
 		HLSBucket:     getEnv("MINIO_HLS_BUCKET", "hls-streams"),
 		TempDir:       getEnv("TEMP_DIR", "./tmp_work"),
 	}
@@ -134,11 +138,11 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 	rawObjectName := parts[len(parts)-1]
 	localRawPath := filepath.Join(localWorkDir, "source.mp4")
 
-	// 1. Download raw file from MinIO
-	log.Printf("[%s] Downloading raw video from MinIO...", payload.VideoID)
-	err := w.MinIOClient.FGetObject(ctx, w.Cfg.RawBucket, rawObjectName, localRawPath, minio.GetObjectOptions{})
+	// 1. Download raw file from CloudWeave
+	log.Printf("[%s] Downloading raw video from CloudWeave...", payload.VideoID)
+	err := downloadCloudWeaveFile(w.Cfg.MinIOEndpoint, w.Cfg.RawBucket, rawObjectName, w.Cfg.MinIOKey, localRawPath)
 	if err != nil {
-		w.failJob(payload.VideoID, fmt.Sprintf("MinIO pull failed: %v", err))
+		w.failJob(payload.VideoID, fmt.Sprintf("CloudWeave pull failed: %v", err))
 		return err
 	}
 
@@ -189,8 +193,8 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 
 	// Check if FFmpeg is available on PATH
 	if _, errLook := exec.LookPath("ffmpeg"); errLook != nil {
-		log.Printf("[%s] FFmpeg not found on PATH. Falling back to direct MinIO video URL...", payload.VideoID)
-		rawVideoUrl := fmt.Sprintf("http://%s/%s/%s", w.Cfg.MinIOEndpoint, w.Cfg.RawBucket, rawObjectName)
+		log.Printf("[%s] FFmpeg not found on PATH. Falling back to direct CloudWeave video URL...", payload.VideoID)
+		rawVideoUrl := fmt.Sprintf("http://%s/files/%s/%s", w.Cfg.MinIOEndpoint, w.Cfg.RawBucket, rawObjectName)
 		
 		_, _ = w.DB.Exec(
 			"UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", 
@@ -237,9 +241,7 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 			contentType = "video/MP2T"
 		}
 
-		_, err = w.MinIOClient.FPutObject(ctx, w.Cfg.HLSBucket, bucketKey, path, minio.PutObjectOptions{
-			ContentType: contentType,
-		})
+		err = uploadCloudWeaveFile(w.Cfg.MinIOEndpoint, w.Cfg.HLSBucket, bucketKey, w.Cfg.MinIOKey, path, contentType)
 		return err
 	})
 
@@ -251,7 +253,7 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 	w.updateJobProgress(payload.VideoID, 95)
 
 	// 4. Update Database statuses to finished
-	hlsUrl := fmt.Sprintf("http://%s/%s/%s/master.m3u8", w.Cfg.MinIOEndpoint, w.Cfg.HLSBucket, payload.VideoID)
+	hlsUrl := fmt.Sprintf("http://%s/files/%s/%s/master.m3u8", w.Cfg.MinIOEndpoint, w.Cfg.HLSBucket, payload.VideoID)
 	
 	tx, err := w.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -303,22 +305,90 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+func cleanEndpoint(endpoint string) string {
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	return strings.TrimSuffix(endpoint, "/")
+}
+
 func ensureBucketsExist(minioClient *minio.Client, buckets ...string) {
 	ctx := context.Background()
 	for _, bucket := range buckets {
 		exists, err := minioClient.BucketExists(ctx, bucket)
-		if err != nil {
-			log.Printf("Error checking MinIO bucket %s: %v", bucket, err)
-			continue
-		}
-		if !exists {
+		if err != nil || !exists {
 			err = minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
 			if err != nil {
-				log.Printf("Error creating MinIO bucket %s: %v", bucket, err)
+				log.Printf("Note: CloudWeave bucket %s initialization: %v", bucket, err)
 			} else {
-				log.Printf("Successfully created MinIO bucket: %s", bucket)
+				log.Printf("Successfully initialized CloudWeave bucket: %s", bucket)
 			}
 		}
 	}
+}
+
+func downloadCloudWeaveFile(endpoint, bucket, objectName, apiKey, destPath string) error {
+	url := fmt.Sprintf("http://%s/files/%s/%s", endpoint, bucket, objectName)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("CloudWeave GET status %d: %s", resp.StatusCode, string(body))
+	}
+	out, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, resp.Body)
+	return err
+}
+
+func uploadCloudWeaveFile(endpoint, bucket, objectName, apiKey, srcPath, contentType string) error {
+	file, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	stat, err := file.Stat()
+	if err != nil {
+		return err
+	}
+
+	url := fmt.Sprintf("http://%s/files/%s/%s", endpoint, bucket, objectName)
+	req, err := http.NewRequest("PUT", url, file)
+	if err != nil {
+		return err
+	}
+	req.ContentLength = stat.Size()
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("X-API-Key", apiKey)
+	}
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("CloudWeave PUT status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
 }
 

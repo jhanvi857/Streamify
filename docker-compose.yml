@@ -37,28 +37,12 @@ services:
       timeout: 5s
       retries: 5
 
-  # 3. MinIO Object Storage (Self-hosted S3-compatible service for raw video files + segmented HLS variants)
-  minio:
-    image: minio/minio:latest
-    container_name: streamify-minio
-    ports:
-      - "9000:9000" # S3 API port
-      - "9001:9001" # Web Console UI port
-    entrypoint: sh
-    command: -c "minio server /data --console-address :9001"
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-    volumes:
-      - miniodata:/data
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+  # 3. CloudWeave Object Storage (Standalone Go Service)
+  # Run CloudWeave natively in its own folder:
+  # go run cmd/node/main.go -port 8080 -data ./data -api-keys "cw_key_streamify=admin"
+  # CloudWeave runs on http://localhost:8080 (S3 API & SigV4 Auth)
 
 volumes:
   pgdata:
   redisdata:
-  miniodata:
+
