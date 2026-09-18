@@ -5,9 +5,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -31,6 +35,7 @@ type Config struct {
 	S3UseSSL    bool
 	RawBucket   string
 	HLSBucket   string
+	TempDir     string
 }
 
 // App holds application state
@@ -77,6 +82,7 @@ func main() {
 		S3UseSSL:    useSSL,
 		RawBucket:   getEnv("S3_RAW_BUCKET", "raw-uploads"),
 		HLSBucket:   getEnv("S3_HLS_BUCKET", "hls-streams"),
+		TempDir:     getEnv("TEMP_DIR", "./tmp_work"),
 	}
 
 	// 1. Initialize PostgreSQL
@@ -129,7 +135,33 @@ func main() {
 		Cfg:         cfg,
 	}
 
-	// 4. Setup Router
+	// 4. Ensure local scratch directory exists for transcoding
+	if err := os.MkdirAll(cfg.TempDir, 0755); err != nil {
+		log.Printf("Warning: Failed to create temp directory: %v", err)
+	}
+
+	// 5. Start embedded Asynq worker daemon in non-blocking goroutine
+	srv := asynq.NewServer(
+		parseRedisOpt(cfg.RedisAddr),
+		asynq.Config{
+			Concurrency: 4, // Up to 4 parallel transcode threads
+			Queues: map[string]int{
+				"default": 10,
+			},
+		},
+	)
+	mux := asynq.NewServeMux()
+	mux.HandleFunc("video:transcode", app.HandleTranscodeTask)
+
+	go func() {
+		log.Printf("Background transcoding worker daemon running...")
+		if err := srv.Start(mux); err != nil {
+			log.Fatalf("Worker failed: %v", err)
+		}
+	}()
+	defer srv.Shutdown()
+
+	// 6. Setup Router
 	r := gin.Default()
 
 	// CORS middleware
@@ -761,3 +793,210 @@ func getValidEnv(keys ...string) string {
 	}
 	return ""
 }
+
+func (app *App) updateJobProgress(videoID string, progress int) {
+	_, _ = app.DB.Exec(
+		"UPDATE transcode_jobs SET progress=$1, updated_at=NOW() WHERE video_id=$2", 
+		progress, videoID,
+	)
+}
+
+func (app *App) failJob(videoID string, reason string) {
+	log.Printf("[%s] Job failed: %s", videoID, reason)
+	_, _ = app.DB.Exec(
+		"UPDATE transcode_jobs SET status='failed', error_message=$1, updated_at=NOW() WHERE video_id=$2", 
+		reason, videoID,
+	)
+}
+
+// HandleTranscodeTask processes video HLS segmentation via FFmpeg in embedded worker
+func (app *App) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
+	var payload TranscodeTaskPayload
+	if err := json.Unmarshal(t.Payload(), &payload); err != nil {
+		return fmt.Errorf("failed to parse payload: %v", err)
+	}
+
+	log.Printf("Received transcoding request for video: %s", payload.VideoID)
+	
+	// Update Postgres job table to 'processing'
+	_, _ = app.DB.Exec(
+		"UPDATE transcode_jobs SET status='processing', progress=5, updated_at=NOW() WHERE video_id=$1", 
+		payload.VideoID,
+	)
+
+	// Prepare directories
+	localWorkDir := filepath.Join(app.Cfg.TempDir, payload.VideoID)
+	_ = os.RemoveAll(localWorkDir)
+	if err := os.MkdirAll(localWorkDir, 0755); err != nil {
+		app.failJob(payload.VideoID, fmt.Sprintf("Failed to create workspace: %v", err))
+		return err
+	}
+	defer os.RemoveAll(localWorkDir)
+
+	// Parse Raw Object Name from input path (e.g. "raw-uploads/raw-xyz.mp4" -> "raw-xyz.mp4")
+	parts := strings.Split(payload.InputPath, "/")
+	rawObjectName := parts[len(parts)-1]
+	localRawPath := filepath.Join(localWorkDir, "source.mp4")
+
+	// 1. Download raw file from S3-compatible storage
+	log.Printf("[%s] Downloading raw video from S3 bucket %s...", payload.VideoID, app.Cfg.RawBucket)
+	obj, err := app.S3Client.GetObject(ctx, app.Cfg.RawBucket, rawObjectName, s3.GetObjectOptions{})
+	if err != nil {
+		app.failJob(payload.VideoID, fmt.Sprintf("S3 download failed: %v", err))
+		return err
+	}
+	defer obj.Close()
+
+	localFile, err := os.Create(localRawPath)
+	if err != nil {
+		app.failJob(payload.VideoID, fmt.Sprintf("Failed to create local destination file: %v", err))
+		return err
+	}
+
+	_, err = io.Copy(localFile, obj)
+	localFile.Close()
+	if err != nil {
+		app.failJob(payload.VideoID, fmt.Sprintf("Failed to stream video to disk: %v", err))
+		return err
+	}
+
+	app.updateJobProgress(payload.VideoID, 15)
+
+	// 2. Transcode HLS Segments using FFmpeg CLI
+	// Compiles multi-bitrate HLS streams: 1080p, 720p, and 360p variants
+	log.Printf("[%s] Invoking FFmpeg transcode pipeline...", payload.VideoID)
+	
+	// Prepare output path
+	hlsOutputDir := filepath.Join(localWorkDir, "hls")
+	if err := os.MkdirAll(hlsOutputDir, 0755); err != nil {
+		app.failJob(payload.VideoID, "HLS directory creation failed")
+		return err
+	}
+
+	// Crafting optimized FFmpeg command mapping stream segments
+	cmdArgs := []string{
+		"-i", localRawPath,
+		"-preset", "veryfast",
+		"-g", "60", // GOP size of 60 (exactly 2s segments for 30fps inputs)
+		"-sc_threshold", "0",
+		
+		// Map variant #1: 360p
+		"-map", "0:v", "-map", "0:a",
+		"-s:v:0", "640x360", "-c:v:0", "libx264", "-b:v:0", "800k", "-maxrate:v:0", "850k", "-bufsize:v:0", "1200k",
+		
+		// Map variant #2: 720p
+		"-map", "0:v", "-map", "0:a",
+		"-s:v:1", "1280x720", "-c:v:1", "libx264", "-b:v:1", "2500k", "-maxrate:v:1", "2700k", "-bufsize:v:1", "4000k",
+		
+		// Map variant #3: 1080p
+		"-map", "0:v", "-map", "0:a",
+		"-s:v:2", "1920x1080", "-c:v:2", "libx264", "-b:v:2", "4800k", "-maxrate:v:2", "5000k", "-bufsize:v:2", "8000k",
+		
+		// Audio encoding parameters
+		"-c:a", "aac", "-b:a", "128k", "-ac", "2",
+		
+		// Master and variant HLS formatting
+		"-f", "hls",
+		"-hls_time", "2", // 2-second media segments
+		"-hls_playlist_type", "vod",
+		"-hls_flags", "independent_segments",
+		"-master_pl_name", "master.m3u8",
+		"-hls_segment_filename", filepath.Join(hlsOutputDir, "v%v/segment_%03d.ts"),
+		"-var_stream_map", "v:0,a:0 v:1,a:1 v:2,a:2",
+		filepath.Join(hlsOutputDir, "v%v/playlist.m3u8"),
+	}
+
+	// Check if FFmpeg is available on PATH
+	if _, errLook := exec.LookPath("ffmpeg"); errLook != nil {
+		log.Printf("[%s] FFmpeg not found on PATH. Falling back to direct video stream...", payload.VideoID)
+		rawVideoUrl := fmt.Sprintf("raw/%s", rawObjectName)
+		
+		_, _ = app.DB.Exec(
+			"UPDATE videos SET manifest_url=$1 WHERE id=$2", 
+			rawVideoUrl, payload.VideoID,
+		)
+		app.updateJobProgress(payload.VideoID, 100)
+		log.Printf("[%s] Transcoding fallback complete. Linked raw video URL: %s", payload.VideoID, rawVideoUrl)
+		return nil
+	}
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", cmdArgs...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("FFmpeg output details:\n%s", string(output))
+		app.failJob(payload.VideoID, fmt.Sprintf("FFmpeg execution error: %v", err))
+		return err
+	}
+
+	app.updateJobProgress(payload.VideoID, 70)
+
+	// 3. Upload all generated HLS segments and manifests to S3 output bucket
+	log.Printf("[%s] Uploading HLS segments & playlists to S3 bucket %s...", payload.VideoID, app.Cfg.HLSBucket)
+	err = filepath.WalkDir(hlsOutputDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		// Calculate relative path inside output bucket (e.g. "v0/playlist.m3u8", "master.m3u8")
+		relPath, err := filepath.Rel(hlsOutputDir, path)
+		if err != nil {
+			return err
+		}
+		
+		// Convert windows backslashes to s3-friendly slashes
+		bucketKey := fmt.Sprintf("%s/%s", payload.VideoID, filepath.ToSlash(relPath))
+		
+		contentType := "application/octet-stream"
+		if strings.HasSuffix(path, ".m3u8") {
+			contentType = "application/vnd.apple.mpegurl"
+		} else if strings.HasSuffix(path, ".ts") {
+			contentType = "video/MP2T"
+		}
+
+		_, err = app.S3Client.FPutObject(ctx, app.Cfg.HLSBucket, bucketKey, path, s3.PutObjectOptions{
+			ContentType: contentType,
+		})
+		return err
+	})
+
+	if err != nil {
+		app.failJob(payload.VideoID, fmt.Sprintf("S3 HLS upload failed: %v", err))
+		return err
+	}
+
+	app.updateJobProgress(payload.VideoID, 95)
+
+	// 4. Update Database statuses to finished
+	hlsUrl := fmt.Sprintf("hls/%s/master.m3u8", payload.VideoID)
+	
+	tx, err := app.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// Update video source link
+	_, err = tx.ExecContext(ctx, "UPDATE videos SET manifest_url=$1 WHERE id=$2", hlsUrl, payload.VideoID)
+	if err != nil {
+		app.failJob(payload.VideoID, "Failed to update video record URL")
+		return err
+	}
+
+	// Update transcode job completion
+	_, err = tx.ExecContext(ctx, "UPDATE transcode_jobs SET status='completed', progress=100, updated_at=NOW() WHERE video_id=$1", payload.VideoID)
+	if err != nil {
+		app.failJob(payload.VideoID, "Failed to update job status")
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	log.Printf("Video %s successfully transcoded and published to S3 HLS catalog", payload.VideoID)
+	return nil
+}
+
