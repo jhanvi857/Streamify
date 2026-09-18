@@ -37,12 +37,20 @@ services:
       timeout: 5s
       retries: 5
 
-  # 3. CloudWeave Object Storage (Standalone Go Service)
-  # Run CloudWeave natively in its own folder:
-  # go run cmd/node/main.go -port 8080 -data ./data -api-keys "cw_key_streamify=admin"
-  # CloudWeave runs on http://localhost:8080 (S3 API & SigV4 Auth)
+  # 3. CloudWeave Object Storage (S3-compatible distributed store)
+  cloudweave:
+    image: ghcr.io/jhanvi857/cloudweave:latest
+    container_name: streamify-cloudweave
+    ports:
+      - "9000:9000"
+    environment:
+      - CLOUDWEAVE_API_KEYS=cw_key_streamify=admin,master-secret-key=admin
+    volumes:
+      - cloudweave_data:/data
+    restart: unless-stopped
 
 volumes:
   pgdata:
   redisdata:
+  cloudweave_data:
 

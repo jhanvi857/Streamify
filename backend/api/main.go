@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -16,27 +15,29 @@ import (
 	"github.com/google/uuid"
 	"github.com/hibiken/asynq"
 	_ "github.com/lib/pq"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	s3 "github.com/minio/minio-go/v7"
+	s3creds "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // Config holds environment configurations
 type Config struct {
-	Port          string
-	DBConn        string
-	RedisAddr     string
-	MinIOEndpoint string
-	MinIOKey      string
-	MinIOSecret   string
-	RawBucket     string
-	HLSBucket     string
+	Port        string
+	DBConn      string
+	RedisAddr   string
+	S3Endpoint  string
+	S3AccessKey string
+	S3SecretKey string
+	S3Region    string
+	S3UseSSL    bool
+	RawBucket   string
+	HLSBucket   string
 }
 
 // App holds application state
 type App struct {
 	DB          *sql.DB
 	AsynqClient *asynq.Client
-	MinIOClient *minio.Client
+	S3Client    *s3.Client
 	Cfg         Config
 }
 
@@ -57,16 +58,22 @@ type TranscodeTaskPayload struct {
 }
 
 func main() {
-	rawEndpoint := getEnv("CLOUDWEAVE_ENDPOINT", getEnv("S3_ENDPOINT", getEnv("MINIO_ENDPOINT", "127.0.0.1:9000")))
+	loadEnv()
+
+	rawEndpoint := getEnv("S3_ENDPOINT", getEnv("CLOUDWEAVE_ENDPOINT", "127.0.0.1:9000"))
+	useSSL := getEnv("S3_USE_SSL", "false") == "true" || strings.HasPrefix(rawEndpoint, "https://")
+
 	cfg := Config{
-		Port:          getEnv("PORT", "8080"),
-		DBConn:        getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
-		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		MinIOEndpoint: cleanEndpoint(rawEndpoint),
-		MinIOKey:      getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_ACCESS_KEY", getEnv("MINIO_ROOT_USER", "cw_key_streamify"))),
-		MinIOSecret:   getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_SECRET_KEY", getEnv("MINIO_ROOT_PASSWORD", "cw_key_streamify"))),
-		RawBucket:     getEnv("MINIO_RAW_BUCKET", getEnv("S3_BUCKET", "raw-uploads")),
-		HLSBucket:     getEnv("MINIO_HLS_BUCKET", "hls-streams"),
+		Port:        getEnv("PORT", "8080"),
+		DBConn:      getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
+		RedisAddr:   getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		S3Endpoint:  cleanEndpoint(rawEndpoint),
+		S3AccessKey: getEnv("S3_ACCESS_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
+		S3SecretKey: getEnv("S3_SECRET_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
+		S3Region:    getEnv("S3_REGION", "us-east-1"),
+		S3UseSSL:    useSSL,
+		RawBucket:   getEnv("S3_RAW_BUCKET", "raw-uploads"),
+		HLSBucket:   getEnv("S3_HLS_BUCKET", "hls-streams"),
 	}
 
 	// 1. Initialize PostgreSQL
@@ -78,17 +85,35 @@ func main() {
 	db.SetMaxOpenConns(25)
 	db.SetMaxIdleConns(5)
 
-	// 2. Initialize MinIO Client
-	minioClient, err := minio.New(cfg.MinIOEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.MinIOKey, cfg.MinIOSecret, ""),
-		Secure: false,
-	})
-	if err != nil {
-		log.Fatalf("Failed to init MinIO: %v", err)
+	// Verify database connection immediately
+	if err := db.Ping(); err != nil {
+		log.Printf("Warning: Database ping failed (%v). Check DATABASE_URL in .env", err)
+	} else {
+		var currentDB, version string
+		_ = db.QueryRow("SELECT current_database(), version()").Scan(&currentDB, &version)
+		isNeon := strings.Contains(strings.ToLower(version), "neon") || strings.Contains(cfg.DBConn, "neon.tech")
+		if isNeon {
+			log.Printf("Connected to Neon PostgreSQL (Cloud) successfully! Database: %s", currentDB)
+		} else {
+			log.Printf("Connected to PostgreSQL successfully! Database: %s", currentDB)
+		}
 	}
 
-	// Ensure MinIO buckets exist
-	ensureBucketsExist(minioClient, cfg.RawBucket, cfg.HLSBucket)
+	// Auto-provision PostgreSQL schema if running against fresh DB (e.g. Neon in production)
+	ensureDatabaseSchema(db)
+
+	// 2. Initialize S3-Compatible Storage Client (CloudWeave for dev, Neon / AWS S3 for prod)
+	s3Client, err := s3.New(cfg.S3Endpoint, &s3.Options{
+		Creds:  s3creds.NewStaticV4(cfg.S3AccessKey, cfg.S3SecretKey, ""),
+		Secure: cfg.S3UseSSL,
+		Region: cfg.S3Region,
+	})
+	if err != nil {
+		log.Fatalf("Failed to init S3 Client: %v", err)
+	}
+
+	// Ensure S3 buckets exist
+	ensureBucketsExist(s3Client, cfg.RawBucket, cfg.HLSBucket)
 
 	// 3. Initialize Asynq client
 	asynqClient := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.RedisAddr})
@@ -96,7 +121,7 @@ func main() {
 
 	app := &App{
 		DB:          db,
-		MinIOClient: minioClient,
+		S3Client:    s3Client,
 		AsynqClient: asynqClient,
 		Cfg:         cfg,
 	}
@@ -108,17 +133,54 @@ func main() {
 	r.Use(func(c *gin.Context) {
 		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE")
+		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, Range")
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, HEAD")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges, Content-Type")
+
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
 		}
+
 		c.Next()
 	})
 
+	// Health check endpoint (verifies if PostgreSQL / Neon is working)
+	healthHandler := func(c *gin.Context) {
+		err := db.Ping()
+		if err != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"status":   "error",
+				"database": "disconnected",
+				"error":    err.Error(),
+			})
+			return
+		}
+		var currentDB, version string
+		_ = db.QueryRow("SELECT current_database(), version()").Scan(&currentDB, &version)
+		isNeon := strings.Contains(strings.ToLower(version), "neon") || strings.Contains(cfg.DBConn, "neon.tech")
+		dbType := "PostgreSQL (Local)"
+		if isNeon {
+			dbType = "Neon PostgreSQL (Cloud)"
+		}
+
+		var tableCount int
+		_ = db.QueryRow("SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public'").Scan(&tableCount)
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":           "ok",
+			"database":         "connected",
+			"database_type":    dbType,
+			"current_database": currentDB,
+			"tables_count":     tableCount,
+			"storage_endpoint": cfg.S3Endpoint,
+		})
+	}
+	r.GET("/health", healthHandler)
+
 	api := r.Group("/api")
 	{
+		api.GET("/health", healthHandler)
 		api.POST("/videos/upload/init", app.handleInitUpload)
 		api.POST("/videos/upload/direct", app.handleDirectUpload)
 		api.POST("/videos/upload/complete", app.handleCompleteUpload)
@@ -126,6 +188,8 @@ func main() {
 		api.GET("/videos/:id", app.handleGetVideo)
 		api.GET("/videos/:id/stream", app.handleStreamVideo)
 		api.GET("/videos/:id/stream/*filepath", app.handleStreamVideo)
+		api.HEAD("/videos/:id/stream", app.handleStreamVideo)
+		api.HEAD("/videos/:id/stream/*filepath", app.handleStreamVideo)
 		api.GET("/videos/:id/status", app.handleGetVideoStatus)
 		api.DELETE("/videos/:id", app.handleDeleteVideo)
 	}
@@ -136,7 +200,7 @@ func main() {
 	}
 }
 
-// handleInitUpload creates a PostgreSQL video entry and generates a MinIO presigned URL
+// handleInitUpload creates a PostgreSQL video entry and generates an S3 presigned URL
 func (app *App) handleInitUpload(c *gin.Context) {
 	var req VideoUploadRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -160,16 +224,16 @@ func (app *App) handleInitUpload(c *gin.Context) {
 		return
 	}
 
-	// Generate MinIO Presigned URL for direct client-to-MinIO uploads
+	// Generate S3 Presigned URL for direct client-to-storage uploads
 	// This reduces backend memory/network pressure
-	presignedURL, err := app.MinIOClient.PresignedPutObject(
+	presignedURL, err := app.S3Client.PresignedPutObject(
 		context.Background(),
 		app.Cfg.RawBucket,
 		objectName,
 		time.Hour*2, // 2-hour upload lease
 	)
 	if err != nil {
-		log.Printf("MinIO Presigned URL Error: %v", err)
+		log.Printf("S3 Presigned URL Error: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate object storage access token"})
 		return
 	}
@@ -182,7 +246,7 @@ func (app *App) handleInitUpload(c *gin.Context) {
 	})
 }
 
-// handleDirectUpload accepts a file stream from client and uploads directly to CloudWeave storage
+// handleDirectUpload accepts a file stream from client and uploads directly to S3-compatible storage via SigV4
 func (app *App) handleDirectUpload(c *gin.Context) {
 	fileHeader, err := c.FormFile("file")
 	if err != nil {
@@ -202,55 +266,41 @@ func (app *App) handleDirectUpload(c *gin.Context) {
 	}
 	defer fileStream.Close()
 
-	log.Printf("Streaming raw video %s (%d bytes) directly into CloudWeave storage...", objectName, fileHeader.Size)
-
-	// Stream directly to CloudWeave native REST API (PUT /files/<bucket>/<key>)
-	cloudweaveURL := fmt.Sprintf("http://%s/files/%s/%s", app.Cfg.MinIOEndpoint, app.Cfg.RawBucket, objectName)
-	req, err := http.NewRequestWithContext(c.Request.Context(), "PUT", cloudweaveURL, fileStream)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare CloudWeave request"})
-		return
-	}
-
-	req.ContentLength = fileHeader.Size
 	contentType := fileHeader.Header.Get("Content-Type")
 	if contentType == "" {
 		contentType = "video/mp4"
 	}
-	req.Header.Set("Content-Type", contentType)
 
-	if app.Cfg.MinIOKey != "" {
-		req.Header.Set("Authorization", "Bearer "+app.Cfg.MinIOKey)
-		req.Header.Set("X-API-Key", app.Cfg.MinIOKey)
-	}
+	log.Printf("Streaming raw video %s (%d bytes) to S3 bucket %s...", objectName, fileHeader.Size, app.Cfg.RawBucket)
 
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Do(req)
+	// Standard S3 PutObject with SigV4 (compatible with CloudWeave in dev, Neon / AWS S3 in prod)
+	_, err = app.S3Client.PutObject(
+		c.Request.Context(),
+		app.Cfg.RawBucket,
+		objectName,
+		fileStream,
+		fileHeader.Size,
+		s3.PutObjectOptions{
+			ContentType: contentType,
+		},
+	)
 	if err != nil {
-		log.Printf("CloudWeave Direct Stream Upload Error: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("CloudWeave upload failed: %v", err)})
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		respBody, _ := io.ReadAll(resp.Body)
-		log.Printf("CloudWeave Upload Status Error (%d): %s", resp.StatusCode, string(respBody))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("CloudWeave upload returned status %d", resp.StatusCode)})
+		log.Printf("S3 Direct Stream Upload Error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("S3 upload failed: %v", err)})
 		return
 	}
 
-	// Update PostgreSQL video record minio_manifest_url so it points directly to CloudWeave stream
-	rawVideoUrl := fmt.Sprintf("http://%s/files/%s/%s", app.Cfg.MinIOEndpoint, app.Cfg.RawBucket, objectName)
+	// Store canonical S3 path identifier in PostgreSQL
 	videoID := strings.TrimPrefix(objectName, "raw-")
 	videoID = strings.TrimSuffix(videoID, ".mp4")
+	rawVideoUrl := fmt.Sprintf("raw/%s", objectName)
 	_, _ = app.DB.Exec("UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", rawVideoUrl, videoID)
 
-	log.Printf("Successfully stored raw video %s in CloudWeave bucket %s", objectName, app.Cfg.RawBucket)
-	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully to CloudWeave"})
+	log.Printf("Successfully stored raw video %s in S3 bucket %s", objectName, app.Cfg.RawBucket)
+	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully to storage"})
 }
 
-// handleStreamVideo proxies video media stream from CloudWeave to HTML5 video element with byte-range support
+// handleStreamVideo streams media objects from S3 to browser with byte-range seek support
 func (app *App) handleStreamVideo(c *gin.Context) {
 	id := c.Param("id")
 	subPath := c.Param("filepath")
@@ -262,68 +312,55 @@ func (app *App) handleStreamVideo(c *gin.Context) {
 		return
 	}
 
-	targetUrl := manifestUrl.String
-	// If stored URL is missing /files/ path for CloudWeave native HTTP server, fix path:
-	if !strings.Contains(targetUrl, "/files/") {
-		if strings.Contains(targetUrl, "9000/") {
-			targetUrl = strings.Replace(targetUrl, "9000/", "9000/files/", 1)
+	target := manifestUrl.String
+	var bucket, objectKey string
+
+	cleanSub := strings.TrimPrefix(subPath, "/")
+	if strings.Contains(target, "master.m3u8") || cleanSub != "" {
+		bucket = app.Cfg.HLSBucket
+		if cleanSub == "" || cleanSub == "master.m3u8" {
+			objectKey = fmt.Sprintf("%s/master.m3u8", id)
+		} else {
+			objectKey = fmt.Sprintf("%s/%s", id, cleanSub)
 		}
+	} else {
+		bucket = app.Cfg.RawBucket
+		objectKey = fmt.Sprintf("raw-%s.mp4", id)
 	}
 
-	if subPath != "" {
-		if idx := strings.LastIndex(targetUrl, "/"); idx != -1 {
-			targetUrl = targetUrl[:idx] + subPath
-		}
-	}
-
-	log.Printf("Proxying video stream for ID %s (subPath: %s) via CloudWeave URL: %s", id, subPath, targetUrl)
-
-	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", targetUrl, nil)
+	opts := s3.GetObjectOptions{}
+	obj, err := app.S3Client.GetObject(c.Request.Context(), bucket, objectKey, opts)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create stream request"})
+		c.JSON(http.StatusNotFound, gin.H{"error": "Failed to retrieve media object"})
+		return
+	}
+	defer obj.Close()
+
+	stat, err := obj.Stat()
+	if err != nil {
+		log.Printf("S3 GetObject Stat Error for %s/%s: %v", bucket, objectKey, err)
+		c.JSON(http.StatusNotFound, gin.H{"error": "Stream object not found"})
 		return
 	}
 
-	// Pass CloudWeave authentication headers
-	if app.Cfg.MinIOKey != "" {
-		req.Header.Set("X-API-Key", app.Cfg.MinIOKey)
-		req.Header.Set("Authorization", "Bearer "+app.Cfg.MinIOKey)
+	contentType := stat.ContentType
+	lowerKey := strings.ToLower(objectKey)
+	if strings.HasSuffix(lowerKey, ".m3u8") {
+		contentType = "application/vnd.apple.mpegurl"
+	} else if strings.HasSuffix(lowerKey, ".ts") {
+		contentType = "video/MP2T"
+	} else if strings.HasSuffix(lowerKey, ".mp4") {
+		contentType = "video/mp4"
 	}
 
-	// Forward Range header if requested by HTML5 video player
-	if rangeHeader := c.GetHeader("Range"); rangeHeader != "" {
-		req.Header.Set("Range", rangeHeader)
+	if contentType != "" {
+		c.Header("Content-Type", contentType)
 	}
-
-	client := &http.Client{Timeout: 60 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("CloudWeave HTTP Stream Fetch Error for %s: %v", targetUrl, err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "CloudWeave stream unreachable"})
-		return
-	}
-	defer resp.Body.Close()
-
-	// Forward CloudWeave headers to browser
-	for key, values := range resp.Header {
-		for _, value := range values {
-			c.Header(key, value)
-		}
-	}
-
-	lowerUrl := strings.ToLower(targetUrl)
-	if strings.HasSuffix(lowerUrl, ".mp4") {
-		c.Header("Content-Type", "video/mp4")
-	} else if strings.HasSuffix(lowerUrl, ".m3u8") {
-		c.Header("Content-Type", "application/x-mpegURL")
-	} else if strings.HasSuffix(lowerUrl, ".ts") {
-		c.Header("Content-Type", "video/MP2T")
-	}
-
 	c.Header("Access-Control-Allow-Origin", "*")
-	c.Status(resp.StatusCode)
 
-	_, _ = io.Copy(c.Writer, resp.Body)
+	// Standard Go http.ServeContent handles Range headers (206 Partial Content),
+	// Content-Range, Content-Length, HEAD requests, and browser seeking seamlessly.
+	http.ServeContent(c.Writer, c.Request, objectKey, stat.LastModified, obj)
 }
 
 // handleCompleteUpload enqueues a transcode task in Redis (Asynq)
@@ -410,7 +447,8 @@ func (app *App) handleListVideos(c *gin.Context) {
 		Category         string    `json:"category"`
 		Visibility       string    `json:"visibility"`
 		AuthorName       string    `json:"author_name"`
-		MinioManifestURL string    `json:"minio_manifest_url"`
+		ManifestURL      string    `json:"manifest_url"`
+		MinioManifestURL string    `json:"minio_manifest_url,omitempty"`
 		Duration         string    `json:"duration"`
 		ViewsCount       int       `json:"views_count"`
 		CreatedAt        time.Time `json:"created_at"`
@@ -426,6 +464,7 @@ func (app *App) handleListVideos(c *gin.Context) {
 			continue
 		}
 		if manifest.Valid {
+			v.ManifestURL = manifest.String
 			v.MinioManifestURL = manifest.String
 		}
 		videos = append(videos, v)
@@ -445,7 +484,8 @@ func (app *App) handleGetVideo(c *gin.Context) {
 		Category         string    `json:"category"`
 		Visibility       string    `json:"visibility"`
 		AuthorName       string    `json:"author_name"`
-		MinioManifestURL string    `json:"minio_manifest_url"`
+		ManifestURL      string    `json:"manifest_url"`
+		MinioManifestURL string    `json:"minio_manifest_url,omitempty"`
 		Duration         string    `json:"duration"`
 		ViewsCount       int       `json:"views_count"`
 		CreatedAt        time.Time `json:"created_at"`
@@ -470,13 +510,14 @@ func (app *App) handleGetVideo(c *gin.Context) {
 	}
 
 	if manifest.Valid {
+		v.ManifestURL = manifest.String
 		v.MinioManifestURL = manifest.String
 	}
 
 	c.JSON(http.StatusOK, v)
 }
 
-// handleDeleteVideo deletes a video record from PostgreSQL and cleans up MinIO objects
+// handleDeleteVideo deletes a video record from PostgreSQL and cleans up S3 storage objects
 func (app *App) handleDeleteVideo(c *gin.Context) {
 	id := c.Param("id")
 
@@ -505,40 +546,40 @@ func (app *App) handleDeleteVideo(c *gin.Context) {
 
 	log.Printf("Successfully deleted video %s from PostgreSQL database (rows affected: %d)", id, rowsAffected)
 
-	// 3. Background cleanup of all storage assets in MinIO (Raw uploads + HLS streams & playlists)
+	// 3. Background cleanup of all storage assets in S3 (Raw uploads + HLS streams & playlists)
 	go func(vid string) {
 		ctx := context.Background()
 
 		// A. Remove raw upload object from raw-uploads bucket
 		rawObjectName := fmt.Sprintf("raw-%s.mp4", vid)
-		err := app.MinIOClient.RemoveObject(ctx, app.Cfg.RawBucket, rawObjectName, minio.RemoveObjectOptions{})
+		err := app.S3Client.RemoveObject(ctx, app.Cfg.RawBucket, rawObjectName, s3.RemoveObjectOptions{})
 		if err != nil {
-			log.Printf("MinIO Raw Cleanup Warning for %s: %v", rawObjectName, err)
+			log.Printf("S3 Raw Cleanup Warning for %s: %v", rawObjectName, err)
 		} else {
-			log.Printf("MinIO raw object %s cleaned up successfully", rawObjectName)
+			log.Printf("S3 raw object %s cleaned up successfully", rawObjectName)
 		}
 
 		// B. Remove all HLS streams, master playlists, and TS segments under prefix vid/
-		opts := minio.ListObjectsOptions{
+		opts := s3.ListObjectsOptions{
 			Prefix:    fmt.Sprintf("%s/", vid),
 			Recursive: true,
 		}
-		for obj := range app.MinIOClient.ListObjects(ctx, app.Cfg.HLSBucket, opts) {
+		for obj := range app.S3Client.ListObjects(ctx, app.Cfg.HLSBucket, opts) {
 			if obj.Err != nil {
-				log.Printf("MinIO List HLS Object Error for %s: %v", obj.Key, obj.Err)
+				log.Printf("S3 List HLS Object Error for %s: %v", obj.Key, obj.Err)
 				continue
 			}
-			err := app.MinIOClient.RemoveObject(ctx, app.Cfg.HLSBucket, obj.Key, minio.RemoveObjectOptions{})
+			err := app.S3Client.RemoveObject(ctx, app.Cfg.HLSBucket, obj.Key, s3.RemoveObjectOptions{})
 			if err != nil {
-				log.Printf("MinIO Remove HLS Object Warning for %s: %v", obj.Key, err)
+				log.Printf("S3 Remove HLS Object Warning for %s: %v", obj.Key, err)
 			} else {
-				log.Printf("MinIO HLS object %s cleaned up successfully", obj.Key)
+				log.Printf("S3 HLS object %s cleaned up successfully", obj.Key)
 			}
 		}
 	}(id)
 
 	c.JSON(http.StatusOK, gin.H{
-		"message": "Video permanently deleted from PostgreSQL database and MinIO object storage",
+		"message": "Video permanently deleted from PostgreSQL database and S3 storage",
 		"id":      id,
 	})
 }
@@ -602,22 +643,88 @@ func (app *App) handleGetVideoStatus(c *gin.Context) {
 		resp["error_message"] = errorMsg.String
 	}
 	if manifestUrl.Valid {
+		resp["manifest_url"] = manifestUrl.String
 		resp["minio_manifest_url"] = manifestUrl.String
 	}
 
 	c.JSON(http.StatusOK, resp)
 }
 
-func ensureBucketsExist(minioClient *minio.Client, buckets ...string) {
+func ensureBucketsExist(s3Client *s3.Client, buckets ...string) {
 	ctx := context.Background()
 	for _, bucket := range buckets {
-		exists, err := minioClient.BucketExists(ctx, bucket)
+		exists, err := s3Client.BucketExists(ctx, bucket)
 		if err != nil || !exists {
-			err = minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+			err = s3Client.MakeBucket(ctx, bucket, s3.MakeBucketOptions{})
 			if err != nil {
-				log.Printf("Note: CloudWeave bucket %s initialization: %v", bucket, err)
+				log.Printf("Note: S3 bucket %s initialization: %v", bucket, err)
 			} else {
-				log.Printf("Successfully initialized CloudWeave bucket: %s", bucket)
+				log.Printf("Successfully initialized S3 bucket: %s", bucket)
+			}
+		}
+	}
+}
+
+// ensureDatabaseSchema automatically verifies and synchronizes PostgreSQL tables & indexes
+// on first boot against any PostgreSQL database (such as Neon in production or Docker in dev).
+func ensureDatabaseSchema(db *sql.DB) {
+	schemaPaths := []string{
+		"./db/schema.sql",
+		"../db/schema.sql",
+		"backend/db/schema.sql",
+		"./backend/db/schema.sql",
+	}
+
+	var content []byte
+	var readErr error
+	for _, path := range schemaPaths {
+		content, readErr = os.ReadFile(path)
+		if readErr == nil {
+			break
+		}
+	}
+
+	if readErr != nil || len(content) == 0 {
+		log.Printf("Note: Could not locate schema.sql (%v), skipping DDL auto-sync", readErr)
+		return
+	}
+
+	if _, err := db.Exec(string(content)); err != nil {
+		log.Printf("Warning: Failed to execute schema.sql: %v", err)
+	} else {
+		log.Println("PostgreSQL schema successfully verified and synchronized")
+	}
+}
+
+// loadEnv loads environment variables from .env or .env.development files
+func loadEnv() {
+	envFiles := []string{
+		".env",
+		".env.development",
+		".env.local",
+		"backend/.env",
+		"backend/.env.development",
+		"../.env",
+		"../.env.development",
+	}
+
+	for _, file := range envFiles {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				k := strings.TrimSpace(parts[0])
+				v := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+				if _, exists := os.LookupEnv(k); !exists {
+					os.Setenv(k, v)
+				}
 			}
 		}
 	}

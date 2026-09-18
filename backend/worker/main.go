@@ -8,29 +8,29 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/hibiken/asynq"
 	_ "github.com/lib/pq"
-	"github.com/minio/minio-go/v7"
-	"github.com/minio/minio-go/v7/pkg/credentials"
+	s3 "github.com/minio/minio-go/v7"
+	s3creds "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
 // Config holds environment configurations
 type Config struct {
-	DBConn        string
-	RedisAddr     string
-	MinIOEndpoint string
-	MinIOKey     string
-	MinIOSecret  string
-	RawBucket    string
-	HLSBucket    string
-	TempDir      string
+	DBConn      string
+	RedisAddr   string
+	S3Endpoint  string
+	S3AccessKey string
+	S3SecretKey string
+	S3Region    string
+	S3UseSSL    bool
+	RawBucket   string
+	HLSBucket   string
+	TempDir     string
 }
 
 // TranscodeTaskPayload defines the schema for incoming tasks
@@ -41,22 +41,28 @@ type TranscodeTaskPayload struct {
 
 // Worker holds task dependencies
 type Worker struct {
-	DB          *sql.DB
-	MinIOClient *minio.Client
-	Cfg         Config
+	DB       *sql.DB
+	S3Client *s3.Client
+	Cfg      Config
 }
 
 func main() {
-	rawEndpoint := getEnv("CLOUDWEAVE_ENDPOINT", getEnv("S3_ENDPOINT", getEnv("MINIO_ENDPOINT", "127.0.0.1:9000")))
+	loadEnv()
+
+	rawEndpoint := getEnv("S3_ENDPOINT", getEnv("CLOUDWEAVE_ENDPOINT", "127.0.0.1:9000"))
+	useSSL := getEnv("S3_USE_SSL", "false") == "true" || strings.HasPrefix(rawEndpoint, "https://")
+
 	cfg := Config{
-		DBConn:        getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
-		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		MinIOEndpoint: cleanEndpoint(rawEndpoint),
-		MinIOKey:      getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_ACCESS_KEY", getEnv("MINIO_ROOT_USER", "cw_key_streamify"))),
-		MinIOSecret:   getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_SECRET_KEY", getEnv("MINIO_ROOT_PASSWORD", "cw_key_streamify"))),
-		RawBucket:     getEnv("MINIO_RAW_BUCKET", getEnv("S3_BUCKET", "raw-uploads")),
-		HLSBucket:     getEnv("MINIO_HLS_BUCKET", "hls-streams"),
-		TempDir:       getEnv("TEMP_DIR", "./tmp_work"),
+		DBConn:      getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
+		RedisAddr:   getEnv("REDIS_ADDR", "127.0.0.1:6379"),
+		S3Endpoint:  cleanEndpoint(rawEndpoint),
+		S3AccessKey: getEnv("S3_ACCESS_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
+		S3SecretKey: getEnv("S3_SECRET_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
+		S3Region:    getEnv("S3_REGION", "us-east-1"),
+		S3UseSSL:    useSSL,
+		RawBucket:   getEnv("S3_RAW_BUCKET", "raw-uploads"),
+		HLSBucket:   getEnv("S3_HLS_BUCKET", "hls-streams"),
+		TempDir:     getEnv("TEMP_DIR", "./tmp_work"),
 	}
 
 	// 1. Initialize PostgreSQL
@@ -66,21 +72,33 @@ func main() {
 	}
 	defer db.Close()
 
-	// 2. Initialize MinIO Client
-	minioClient, err := minio.New(cfg.MinIOEndpoint, &minio.Options{
-		Creds:  credentials.NewStaticV4(cfg.MinIOKey, cfg.MinIOSecret, ""),
-		Secure: false,
-	})
-	if err != nil {
-		log.Fatalf("Failed to init MinIO: %v", err)
+	if err := db.Ping(); err != nil {
+		log.Printf("Warning: Worker database ping failed (%v). Check DATABASE_URL in .env", err)
+	} else {
+		var currentDB string
+		_ = db.QueryRow("SELECT current_database()").Scan(&currentDB)
+		log.Printf("Worker connected to PostgreSQL successfully! Database: %s", currentDB)
 	}
 
-	ensureBucketsExist(minioClient, cfg.RawBucket, cfg.HLSBucket)
+	// Auto-provision PostgreSQL schema if running against fresh DB (e.g. Neon in production)
+	ensureDatabaseSchema(db)
+
+	// 2. Initialize S3-Compatible Storage Client (CloudWeave for dev, Neon / AWS S3 for prod)
+	s3Client, err := s3.New(cfg.S3Endpoint, &s3.Options{
+		Creds:  s3creds.NewStaticV4(cfg.S3AccessKey, cfg.S3SecretKey, ""),
+		Secure: cfg.S3UseSSL,
+		Region: cfg.S3Region,
+	})
+	if err != nil {
+		log.Fatalf("Failed to init S3 Client: %v", err)
+	}
+
+	ensureBucketsExist(s3Client, cfg.RawBucket, cfg.HLSBucket)
 
 	worker := &Worker{
-		DB:          db,
-		MinIOClient: minioClient,
-		Cfg:         cfg,
+		DB:       db,
+		S3Client: s3Client,
+		Cfg:      cfg,
 	}
 
 	// 3. Ensure local temp directories exist
@@ -138,11 +156,25 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 	rawObjectName := parts[len(parts)-1]
 	localRawPath := filepath.Join(localWorkDir, "source.mp4")
 
-	// 1. Download raw file from CloudWeave
-	log.Printf("[%s] Downloading raw video from CloudWeave...", payload.VideoID)
-	err := downloadCloudWeaveFile(w.Cfg.MinIOEndpoint, w.Cfg.RawBucket, rawObjectName, w.Cfg.MinIOKey, localRawPath)
+	// 1. Download raw file from S3-compatible storage
+	log.Printf("[%s] Downloading raw video from S3 bucket %s...", payload.VideoID, w.Cfg.RawBucket)
+	obj, err := w.S3Client.GetObject(ctx, w.Cfg.RawBucket, rawObjectName, s3.GetObjectOptions{})
 	if err != nil {
-		w.failJob(payload.VideoID, fmt.Sprintf("CloudWeave pull failed: %v", err))
+		w.failJob(payload.VideoID, fmt.Sprintf("S3 download failed: %v", err))
+		return err
+	}
+	defer obj.Close()
+
+	localFile, err := os.Create(localRawPath)
+	if err != nil {
+		w.failJob(payload.VideoID, fmt.Sprintf("Failed to create local destination file: %v", err))
+		return err
+	}
+
+	_, err = io.Copy(localFile, obj)
+	localFile.Close()
+	if err != nil {
+		w.failJob(payload.VideoID, fmt.Sprintf("Failed to stream video to disk: %v", err))
 		return err
 	}
 
@@ -193,8 +225,8 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 
 	// Check if FFmpeg is available on PATH
 	if _, errLook := exec.LookPath("ffmpeg"); errLook != nil {
-		log.Printf("[%s] FFmpeg not found on PATH. Falling back to direct CloudWeave video URL...", payload.VideoID)
-		rawVideoUrl := fmt.Sprintf("http://%s/files/%s/%s", w.Cfg.MinIOEndpoint, w.Cfg.RawBucket, rawObjectName)
+		log.Printf("[%s] FFmpeg not found on PATH. Falling back to direct video stream...", payload.VideoID)
+		rawVideoUrl := fmt.Sprintf("raw/%s", rawObjectName)
 		
 		_, _ = w.DB.Exec(
 			"UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", 
@@ -215,8 +247,8 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 
 	w.updateJobProgress(payload.VideoID, 70)
 
-	// 3. Upload all generated HLS segments and manifests to MinIO
-	log.Printf("[%s] Uploading HLS segments & playlists to MinIO output bucket...", payload.VideoID)
+	// 3. Upload all generated HLS segments and manifests to S3 output bucket
+	log.Printf("[%s] Uploading HLS segments & playlists to S3 bucket %s...", payload.VideoID, w.Cfg.HLSBucket)
 	err = filepath.WalkDir(hlsOutputDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -236,24 +268,26 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 		
 		contentType := "application/octet-stream"
 		if strings.HasSuffix(path, ".m3u8") {
-			contentType = "application/x-mpegURL"
+			contentType = "application/vnd.apple.mpegurl"
 		} else if strings.HasSuffix(path, ".ts") {
 			contentType = "video/MP2T"
 		}
 
-		err = uploadCloudWeaveFile(w.Cfg.MinIOEndpoint, w.Cfg.HLSBucket, bucketKey, w.Cfg.MinIOKey, path, contentType)
+		_, err = w.S3Client.FPutObject(ctx, w.Cfg.HLSBucket, bucketKey, path, s3.PutObjectOptions{
+			ContentType: contentType,
+		})
 		return err
 	})
 
 	if err != nil {
-		w.failJob(payload.VideoID, fmt.Sprintf("MinIO push failed: %v", err))
+		w.failJob(payload.VideoID, fmt.Sprintf("S3 HLS upload failed: %v", err))
 		return err
 	}
 
 	w.updateJobProgress(payload.VideoID, 95)
 
 	// 4. Update Database statuses to finished
-	hlsUrl := fmt.Sprintf("http://%s/files/%s/%s/master.m3u8", w.Cfg.MinIOEndpoint, w.Cfg.HLSBucket, payload.VideoID)
+	hlsUrl := fmt.Sprintf("hls/%s/master.m3u8", payload.VideoID)
 	
 	tx, err := w.DB.BeginTx(ctx, nil)
 	if err != nil {
@@ -279,7 +313,7 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 		return err
 	}
 
-	log.Printf("Video %s successfully transcoded and published to MinIO HLS catalog", payload.VideoID)
+	log.Printf("Video %s successfully transcoded and published to S3 HLS catalog", payload.VideoID)
 	return nil
 }
 
@@ -311,84 +345,83 @@ func cleanEndpoint(endpoint string) string {
 	return strings.TrimSuffix(endpoint, "/")
 }
 
-func ensureBucketsExist(minioClient *minio.Client, buckets ...string) {
+func ensureBucketsExist(s3Client *s3.Client, buckets ...string) {
 	ctx := context.Background()
 	for _, bucket := range buckets {
-		exists, err := minioClient.BucketExists(ctx, bucket)
+		exists, err := s3Client.BucketExists(ctx, bucket)
 		if err != nil || !exists {
-			err = minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
+			err = s3Client.MakeBucket(ctx, bucket, s3.MakeBucketOptions{})
 			if err != nil {
-				log.Printf("Note: CloudWeave bucket %s initialization: %v", bucket, err)
+				log.Printf("Note: S3 bucket %s initialization: %v", bucket, err)
 			} else {
-				log.Printf("Successfully initialized CloudWeave bucket: %s", bucket)
+				log.Printf("Successfully initialized S3 bucket: %s", bucket)
 			}
 		}
 	}
 }
 
-func downloadCloudWeaveFile(endpoint, bucket, objectName, apiKey, destPath string) error {
-	url := fmt.Sprintf("http://%s/files/%s/%s", endpoint, bucket, objectName)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return err
+// ensureDatabaseSchema automatically verifies and synchronizes PostgreSQL tables & indexes
+// on first boot against any PostgreSQL database (such as Neon in production or Docker in dev).
+func ensureDatabaseSchema(db *sql.DB) {
+	schemaPaths := []string{
+		"./db/schema.sql",
+		"../db/schema.sql",
+		"backend/db/schema.sql",
+		"./backend/db/schema.sql",
 	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("X-API-Key", apiKey)
+
+	var content []byte
+	var readErr error
+	for _, path := range schemaPaths {
+		content, readErr = os.ReadFile(path)
+		if readErr == nil {
+			break
+		}
 	}
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
+
+	if readErr != nil || len(content) == 0 {
+		log.Printf("Note: Could not locate schema.sql (%v), skipping DDL auto-sync", readErr)
+		return
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("CloudWeave GET status %d: %s", resp.StatusCode, string(body))
+
+	if _, err := db.Exec(string(content)); err != nil {
+		log.Printf("Warning: Failed to execute schema.sql: %v", err)
+	} else {
+		log.Println("PostgreSQL schema successfully verified and synchronized")
 	}
-	out, err := os.Create(destPath)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, resp.Body)
-	return err
 }
 
-func uploadCloudWeaveFile(endpoint, bucket, objectName, apiKey, srcPath, contentType string) error {
-	file, err := os.Open(srcPath)
-	if err != nil {
-		return err
-	}
-	defer file.Close()
-	stat, err := file.Stat()
-	if err != nil {
-		return err
+// loadEnv loads environment variables from .env or .env.development files
+func loadEnv() {
+	envFiles := []string{
+		".env",
+		".env.development",
+		".env.local",
+		"backend/.env",
+		"backend/.env.development",
+		"../.env",
+		"../.env.development",
 	}
 
-	url := fmt.Sprintf("http://%s/files/%s/%s", endpoint, bucket, objectName)
-	req, err := http.NewRequest("PUT", url, file)
-	if err != nil {
-		return err
+	for _, file := range envFiles {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) == 2 {
+				k := strings.TrimSpace(parts[0])
+				v := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
+				if _, exists := os.LookupEnv(k); !exists {
+					os.Setenv(k, v)
+				}
+			}
+		}
 	}
-	req.ContentLength = stat.Size()
-	if contentType != "" {
-		req.Header.Set("Content-Type", contentType)
-	}
-	if apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("X-API-Key", apiKey)
-	}
-	client := &http.Client{Timeout: 30 * time.Minute}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("CloudWeave PUT status %d: %s", resp.StatusCode, string(body))
-	}
-	return nil
 }
 
