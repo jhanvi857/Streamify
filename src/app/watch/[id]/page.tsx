@@ -24,21 +24,81 @@ export default function WatchPage() {
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [hoverPercent, setHoverPercent] = useState<number>(0);
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [showControls, setShowControls] = useState(true);
+  const controlsTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const [playFeedback, setPlayFeedback] = useState<{ type: "play" | "pause" | "seek-back" | "seek-forward"; id: number } | null>(null);
+  const [volume, setVolume] = useState(1);
+  const [isMuted, setIsMuted] = useState(false);
+
+  const triggerFeedback = (type: "play" | "pause" | "seek-back" | "seek-forward") => {
+    setPlayFeedback({ type, id: Date.now() });
+    setTimeout(() => {
+      setPlayFeedback((prev) => (prev?.type === type ? null : prev));
+    }, 650);
+  };
+
+  const handleMouseMove = () => {
+    setShowControls(true);
+    if (controlsTimeoutRef.current) clearTimeout(controlsTimeoutRef.current);
+    if (isPlaying) {
+      controlsTimeoutRef.current = setTimeout(() => {
+        setShowControls(false);
+      }, 2500);
+    }
+  };
+
+  const handleMouseLeave = () => {
+    if (isPlaying) {
+      setShowControls(false);
+    }
+  };
 
   const toggleRealPlay = () => {
     if (realVideoRef.current) {
       if (isPlaying) {
         realVideoRef.current.pause();
+        triggerFeedback("pause");
       } else {
         const playPromise = realVideoRef.current.play();
         if (playPromise !== undefined) {
-          playPromise.catch((err) => {
-            console.warn("Video playback pending or auto-play restricted:", err);
-          });
+          playPromise
+            .then(() => triggerFeedback("play"))
+            .catch((err) => {
+              console.warn("Video playback pending or auto-play restricted:", err);
+            });
         }
       }
     } else {
       setIsPlaying(!isPlaying);
+      triggerFeedback(!isPlaying ? "play" : "pause");
+    }
+  };
+
+  const toggleMute = (e?: React.MouseEvent) => {
+    e?.stopPropagation();
+    if (realVideoRef.current) {
+      const nextMuted = !isMuted;
+      realVideoRef.current.muted = nextMuted;
+      setIsMuted(nextMuted);
+    }
+  };
+
+  const handleVolumeChange = (newVol: number) => {
+    setVolume(newVol);
+    if (realVideoRef.current) {
+      realVideoRef.current.volume = newVol;
+      realVideoRef.current.muted = newVol === 0;
+      setIsMuted(newVol === 0);
+    }
+  };
+
+  const seekRelative = (seconds: number) => {
+    if (realVideoRef.current) {
+      const duration = realVideoRef.current.duration || realDuration || 1;
+      const target = Math.max(0, Math.min(duration, realVideoRef.current.currentTime + seconds));
+      realVideoRef.current.currentTime = target;
+      setCurrentTime(target);
+      triggerFeedback(seconds > 0 ? "seek-forward" : "seek-back");
     }
   };
 
@@ -88,11 +148,20 @@ export default function WatchPage() {
       } else if (e.key === " " || e.key === "k" || e.key === "K") {
         e.preventDefault();
         toggleRealPlay();
+      } else if (e.key === "m" || e.key === "M") {
+        e.preventDefault();
+        toggleMute();
+      } else if (e.key === "ArrowLeft") {
+        e.preventDefault();
+        seekRelative(-5);
+      } else if (e.key === "ArrowRight") {
+        e.preventDefault();
+        seekRelative(5);
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [isPlaying]);
+  }, [isPlaying, isMuted, realDuration]);
   const [playbackSpeed, setPlaybackSpeed] = useState(1);
   const [qualityMode, setQualityMode] = useState<"Auto" | "1080p" | "720p" | "360p">("Auto");
   const [isBuffering, setIsBuffering] = useState(false);
@@ -146,6 +215,15 @@ export default function WatchPage() {
       // 2. Fetch from Go Backend API
       const backendVid = await fetchVideoByIdFromApi(targetId);
       if (backendVid) {
+        const streamRaw = backendVid.manifest_url || backendVid.minio_manifest_url;
+        const streamFull = streamRaw
+          ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api"}/videos/${backendVid.id}/stream${
+              streamRaw.includes("master.m3u8") || streamRaw.startsWith("hls/")
+                ? "/master.m3u8"
+                : ""
+            }`
+          : undefined;
+
         setVideo({
           id: backendVid.id,
           title: backendVid.title,
@@ -156,9 +234,8 @@ export default function WatchPage() {
           date: new Date(backendVid.created_at).toLocaleDateString(),
           duration: backendVid.duration || "00:00",
           visibility: backendVid.visibility || "public",
-          minioManifestUrl: backendVid.minio_manifest_url
-            ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api"}/videos/${backendVid.id}/stream`
-            : undefined,
+          manifestUrl: streamFull,
+          minioManifestUrl: streamFull,
         });
       } else if (isLoaded) {
         setVideo(null);
@@ -169,10 +246,11 @@ export default function WatchPage() {
   }, [id, videos, isLoaded]);
 
   // HLS & MP4 video player initialization effect
+  const activeStreamUrl = video?.manifestUrl || video?.minioManifestUrl;
   useEffect(() => {
-    if (!video?.minioManifestUrl || !realVideoRef.current) return;
+    if (!activeStreamUrl || !realVideoRef.current) return;
     const videoEl = realVideoRef.current;
-    const manifestUrl = video.minioManifestUrl;
+    const manifestUrl = activeStreamUrl;
 
     let hls: Hls | null = null;
     if (Hls.isSupported() && manifestUrl.includes(".m3u8")) {
@@ -196,7 +274,7 @@ export default function WatchPage() {
         hls.destroy();
       }
     };
-  }, [video?.minioManifestUrl]);
+  }, [activeStreamUrl]);
 
   // SVG flow ticker
   useEffect(() => {
@@ -535,31 +613,35 @@ export default function WatchPage() {
         <section className="lg:col-span-7 flex flex-col gap-4">
           
           {/* Mock Video Player container */}
-          <div ref={playerContainerRef} className="relative aspect-video w-full bg-black rounded-2xl overflow-hidden border border-dark-border group">
-            
+          <div
+            ref={playerContainerRef}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={handleMouseLeave}
+            onClick={toggleRealPlay}
+            className="relative aspect-video w-full bg-black rounded-2xl overflow-hidden border border-dark-border group select-none cursor-pointer"
+          >
             {/* Player Canvas Display */}
             <div className="absolute inset-0 flex items-center justify-center bg-neutral-950">
-              {video.minioManifestUrl ? (
+              {(video.manifestUrl || video.minioManifestUrl) ? (
                 <video
-                  key={video.minioManifestUrl}
+                  key={video.manifestUrl || video.minioManifestUrl}
                   ref={realVideoRef}
-                  src={video.minioManifestUrl}
-                  controls
+                  src={video.manifestUrl || video.minioManifestUrl}
                   playsInline
-                  className="w-full h-full object-contain cursor-pointer transition-all duration-300"
+                  className="w-full h-full object-contain pointer-events-none transition-all duration-300"
                   style={{
-                    filter: activeQuality === "360p"
-                      ? "contrast(0.9) brightness(0.95) blur(0.6px)"
-                      : activeQuality === "720p"
-                      ? "contrast(0.98) blur(0.2px)"
-                      : "none"
+                    filter:
+                      activeQuality === "360p"
+                        ? "contrast(0.9) brightness(0.95) blur(0.6px)"
+                        : activeQuality === "720p"
+                        ? "contrast(0.98) blur(0.2px)"
+                        : "none",
                   }}
-                  onClick={toggleRealPlay}
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
                   onError={() => {
                     // Suppress false-alarm warning if video is HLS (.m3u8) processed by hls.js
-                    if (video.minioManifestUrl?.includes(".m3u8")) return;
+                    if ((video.manifestUrl || video.minioManifestUrl)?.includes(".m3u8")) return;
                     console.warn("Video stream pending or format restricted");
                   }}
                   onLoadedMetadata={(e) => {
@@ -588,7 +670,10 @@ export default function WatchPage() {
                   {/* Play symbol indicator */}
                   {!isPlaying && !isBuffering && (
                     <button
-                      onClick={toggleRealPlay}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        toggleRealPlay();
+                      }}
                       className="z-10 h-16 w-16 rounded-full bg-brand-red hover:bg-brand-red-hover text-white flex items-center justify-center shadow-lg transition-transform hover:scale-110 active:scale-95 duration-200 cursor-pointer"
                     >
                       <svg className="h-6 w-6" fill="currentColor" viewBox="0 0 24 24">
@@ -600,8 +685,10 @@ export default function WatchPage() {
                   {/* Simulated visual video stream frame content */}
                   {isPlaying && !isBuffering && (
                     <div className="flex flex-col items-center text-center p-6 gap-2 select-none pointer-events-none">
-                      {/* Rotating visual elements depending on topic */}
-                      <div className="h-14 w-14 rounded-full border-2 border-dashed border-brand-red/40 flex items-center justify-center animate-spin" style={{ animationDuration: "12s" }}>
+                      <div
+                        className="h-14 w-14 rounded-full border-2 border-dashed border-brand-red/40 flex items-center justify-center animate-spin"
+                        style={{ animationDuration: "12s" }}
+                      >
                         <svg className="h-6 w-6 text-brand-red" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
                         </svg>
@@ -618,12 +705,64 @@ export default function WatchPage() {
               )}
             </div>
 
+            {/* Centered YouTube Play/Pause/Seek Ripple Pop Feedback */}
+            {playFeedback && (
+              <div className="absolute inset-0 pointer-events-none flex items-center justify-center z-30">
+                <div className="h-20 w-20 rounded-full bg-black/75 backdrop-blur-md border border-white/20 flex items-center justify-center text-white shadow-2xl transition-all scale-100 animate-in fade-in zoom-in-75 duration-200">
+                  {playFeedback.type === "play" && (
+                    <svg className="h-10 w-10 translate-x-0.5" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M8 5v14l11-7z" />
+                    </svg>
+                  )}
+                  {playFeedback.type === "pause" && (
+                    <svg className="h-10 w-10" fill="currentColor" viewBox="0 0 24 24">
+                      <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
+                    </svg>
+                  )}
+                  {playFeedback.type === "seek-back" && (
+                    <div className="flex flex-col items-center">
+                      <svg className="h-7 w-7" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z" />
+                      </svg>
+                      <span className="text-[9px] font-mono font-bold mt-0.5">-5s</span>
+                    </div>
+                  )}
+                  {playFeedback.type === "seek-forward" && (
+                    <div className="flex flex-col items-center">
+                      <svg className="h-7 w-7" fill="currentColor" viewBox="0 0 24 24">
+                        <path d="M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z" />
+                      </svg>
+                      <span className="text-[9px] font-mono font-bold mt-0.5">+5s</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+
+            {/* Centered Big Play Button When Paused */}
+            {!isPlaying && !isBuffering && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-20">
+                <div className="h-18 w-18 rounded-full bg-black/60 backdrop-blur-md border border-white/20 flex items-center justify-center text-white shadow-2xl transition-all group-hover:scale-110 group-hover:bg-brand-red group-hover:border-brand-red duration-200">
+                  <svg className="h-8 w-8 translate-x-0.5" fill="currentColor" viewBox="0 0 24 24">
+                    <path d="M8 5v14l11-7z" />
+                  </svg>
+                </div>
+              </div>
+            )}
+
             {/* Nerds overlay stats dashboard */}
             {statsForNerds && (
-              <div className="absolute top-4 left-4 z-30 bg-black/85 border border-dark-border rounded-xl p-3 font-mono text-[9px] text-emerald-400/90 leading-relaxed max-w-[280px]">
+              <div
+                onClick={(e) => e.stopPropagation()}
+                className="absolute top-4 left-4 z-30 bg-black/85 border border-dark-border rounded-xl p-3 font-mono text-[9px] text-emerald-400/90 leading-relaxed max-w-[280px]"
+              >
                 <div className="flex justify-between border-b border-dark-border/40 pb-1 mb-1 font-bold text-gray-300 text-[10px]">
                   <span>Telemetry Stats</span>
-                  <button onClick={() => setStatsForNerds(false)} className="text-gray-500 hover:text-white cursor-pointer">✕</button>
+                  <button onClick={() => setStatsForNerds(false)} className="text-gray-500 hover:text-white cursor-pointer p-0.5">
+                    <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
                 </div>
                 <div>Connection Speed: <span className="text-white">{bandwidthMbps.toFixed(1)} Mbps</span></div>
                 <div>Selected Quality: <span className="text-white">{qualityMode} ({activeQuality})</span></div>
@@ -635,10 +774,16 @@ export default function WatchPage() {
               </div>
             )}
 
-            {/* Custom control bar (Always visible red progress bar, expandable controls on hover) */}
-            <div className="absolute bottom-0 inset-x-0 z-20 bg-gradient-to-t from-black/95 via-black/75 to-transparent px-4 pb-3 pt-6 flex flex-col gap-2 transition-opacity duration-200">
-              
-              {/* YouTube-authentic Interactive Timeline Scrubber */}
+            {/* Sleek YouTube Custom Control Bar (Auto-hides on inactivity when playing) */}
+            <div
+              onClick={(e) => e.stopPropagation()}
+              className={`absolute bottom-0 inset-x-0 z-20 bg-gradient-to-t from-black/95 via-black/80 to-transparent px-4 pb-3 pt-8 flex flex-col gap-2 transition-all duration-300 ${
+                showControls || !isPlaying
+                  ? "opacity-100 pointer-events-auto translate-y-0"
+                  : "opacity-0 pointer-events-none translate-y-2"
+              }`}
+            >
+              {/* YouTube Interactive Timeline Scrubber */}
               <div
                 className="relative w-full h-4 cursor-pointer flex items-center group/scrubber"
                 onMouseMove={(e) => {
@@ -649,6 +794,7 @@ export default function WatchPage() {
                 }}
                 onMouseLeave={() => setHoverTime(null)}
                 onClick={(e) => {
+                  e.stopPropagation();
                   const rect = e.currentTarget.getBoundingClientRect();
                   const pct = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
                   const targetTime = pct * videoDurationSec;
@@ -669,7 +815,7 @@ export default function WatchPage() {
                 )}
 
                 {/* Track background */}
-                <div className="w-full bg-gray-600/60 h-1.5 group-hover/scrubber:h-2.5 rounded-full transition-all duration-150 relative overflow-hidden">
+                <div className="w-full bg-gray-600/60 h-1 group-hover/scrubber:h-2 rounded-full transition-all duration-150 relative overflow-hidden">
                   {/* YouTube Bright Red Progress Line */}
                   <div
                     className="bg-brand-red h-full rounded-full transition-all duration-75 shadow-sm"
@@ -679,42 +825,70 @@ export default function WatchPage() {
 
                 {/* YouTube Red Scrubber Thumb Handle */}
                 <div
-                  className="absolute h-3.5 w-3.5 bg-brand-red border-2 border-white rounded-full shadow-md transform -translate-x-1/2 scale-0 group-hover/scrubber:scale-100 transition-transform duration-150 pointer-events-none"
+                  className="absolute h-3 w-3 bg-brand-red border-2 border-white rounded-full shadow-md transform -translate-x-1/2 scale-0 group-hover/scrubber:scale-100 transition-transform duration-150 pointer-events-none"
                   style={{ left: `${percentage}%` }}
                 />
               </div>
 
               {/* Control buttons */}
               <div className="flex items-center justify-between text-white text-xs mt-1">
-                <div className="flex items-center gap-4">
-                  {/* PlayPause */}
+                <div className="flex items-center gap-3">
+                  {/* Play/Pause Button */}
                   <button
-                    onClick={toggleRealPlay}
-                    className="hover:text-brand-red transition-colors cursor-pointer"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleRealPlay();
+                    }}
+                    title={isPlaying ? "Pause (k/space)" : "Play (k/space)"}
+                    className="hover:text-brand-red transition-colors p-1 cursor-pointer"
                   >
                     {isPlaying ? (
-                      <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
+                      <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z" />
                       </svg>
                     ) : (
-                      <svg className="h-4 w-4" fill="currentColor" viewBox="0 0 24 24">
+                      <svg className="h-5 w-5" fill="currentColor" viewBox="0 0 24 24">
                         <path d="M8 5v14l11-7z" />
                       </svg>
                     )}
                   </button>
 
-                  {/* Volume icon */}
-                  <svg className="h-4 w-4 text-gray-300 hover:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
-                  </svg>
+                  {/* Volume Control with Interactive Slider */}
+                  <div className="flex items-center group/vol gap-1">
+                    <button
+                      onClick={toggleMute}
+                      title={isMuted ? "Unmute (m)" : "Mute (m)"}
+                      className="text-gray-300 hover:text-white p-1 transition-colors cursor-pointer"
+                    >
+                      {isMuted || volume === 0 ? (
+                        <svg className="h-4 w-4 text-brand-red" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2" />
+                        </svg>
+                      ) : (
+                        <svg className="h-4 w-4 text-gray-300 hover:text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072m2.828-9.9a9 9 0 010 12.728M5.586 15H4a1 1 0 01-1-1v-4a1 1 0 011-1h1.586l4.707-4.707C10.923 3.663 12 4.109 12 5v14c0 .891-1.077 1.337-1.707.707L5.586 15z" />
+                        </svg>
+                      )}
+                    </button>
+                    <input
+                      type="range"
+                      min="0"
+                      max="1"
+                      step="0.05"
+                      value={isMuted ? 0 : volume}
+                      onChange={(e) => handleVolumeChange(parseFloat(e.target.value))}
+                      className="w-0 group-hover/vol:w-16 transition-all duration-200 accent-brand-red h-1 bg-gray-600 rounded-lg cursor-pointer"
+                    />
+                  </div>
 
                   {/* Timestamp */}
-                  <span className="font-mono text-[10px] text-gray-300">
+                  <span className="font-mono text-[10px] text-gray-300 select-none">
                     {formatTime(currentTime)} / {realDuration > 0 ? formatTime(realDuration) : video.duration}
                   </span>
                 </div>
 
-                <div className="flex items-center gap-4">
+                <div className="flex items-center gap-3">
                   {/* Active quality badge */}
                   <span className="bg-brand-red/10 border border-brand-red/30 text-brand-red text-[9px] font-mono font-bold px-1.5 py-0.5 rounded uppercase">
                     {activeQuality}
@@ -760,17 +934,16 @@ export default function WatchPage() {
                   >
                     {isFullscreen ? (
                       <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 9L4 4m0 0l5 0m-5 0l0 5m6 6l5 5m0 0l-5 0m5 0l0-5M9 15l-5 5m0 0l5 0m-5 0l0-5m15-6l-5-5m0 0l5 0m-5 0l0 5" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
                       </svg>
                     ) : (
                       <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-5h-4m4 0v4m0-4l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 8V4m0 0h4M4 4l5 5m11-1V4m0 0h-4m4 0l-5 5M4 16v4m0 0h4m-4 0l5-5m11 5l-5-5m5 5v-4m0 4h-4" />
                       </svg>
                     )}
                   </button>
                 </div>
               </div>
-
             </div>
           </div>
 
@@ -1128,7 +1301,7 @@ export default function WatchPage() {
                       {uploadStatus === "uploading"
                         ? "Uploading chunks..."
                         : uploadStatus === "assembling"
-                        ? "Assembling parts on MinIO..."
+                        ? "Assembling parts on storage..."
                         : "Trigger Resumable Chunked Upload"}
                     </button>
 
