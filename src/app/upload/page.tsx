@@ -7,7 +7,7 @@ import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
 import { useSession } from "@/lib/auth-client";
-import { initVideoUpload, uploadFileToMinIO, completeVideoUpload, fetchTranscodeStatus } from "@/lib/api";
+import { initVideoUpload, uploadFileToCloudWeave, completeVideoUpload, fetchTranscodeStatus } from "@/lib/api";
 
 export default function UploadPage() {
   const router = useRouter();
@@ -140,15 +140,16 @@ export default function UploadPage() {
     if (initRes && initRes.upload_url) {
       setFinishedVideoId(initRes.video_id);
 
-      // Step 2: Upload File to MinIO S3 Presigned URL
-      const uploadSuccess = await uploadFileToMinIO(
+      // Step 2: Upload File to CloudWeave S3 Presigned URL (with proxy fallback)
+      const uploadSuccess = await uploadFileToCloudWeave(
         initRes.upload_url,
         file,
+        initRes.object_name,
         (percent) => setUploadProgress(percent)
       );
 
       if (!uploadSuccess) {
-        setUploadError("MinIO Upload Failure: Could not upload file binary to Object Storage raw bucket.");
+        setUploadError("CloudWeave Upload Failure: Could not upload file binary to Object Storage raw bucket.");
         return;
       }
 
@@ -226,8 +227,8 @@ export default function UploadPage() {
         setSimStep("manifest");
         setGeneratedManifests([
           "COMPILE: HLS master playlist and video segments built.",
-          "COMPILE: Uploaded HLS playlists & TS chunks to MinIO destination bucket.",
-          `HLS URL: ${statusRes.minio_manifest_url || "MinIO HLS Stream Ready"}`,
+          "COMPILE: Uploaded HLS playlists & TS chunks to CloudWeave destination bucket.",
+          `HLS URL: ${statusRes.minio_manifest_url || "CloudWeave HLS Stream Ready"}`,
         ]);
 
         setTimeout(() => {
@@ -241,7 +242,7 @@ export default function UploadPage() {
   const triggerRedisStep = () => {
     setSimStep("redis");
     const logs = [
-      "SYSTEM: Upload session complete. MinIO File HASH: sha256_f8a3d90214e",
+      "SYSTEM: Upload session complete. CloudWeave File HASH: sha256_f8a3d90214e",
       "GO API SERVER: Writing record to PostgreSQL database (status = 'pending')",
       "GO API SERVER: PostgreSQL row initialized. Preparing Asynq task payload...",
       "ASYNQ CLIENT: Enqueued task 'video:transcode' to Redis queue 'default'",
@@ -266,7 +267,7 @@ export default function UploadPage() {
   const triggerFfmpegStep = () => {
     setSimStep("ffmpeg");
     const logs = [
-      "FFMPEG: Input #0, mov,mp4,m4a, from 'minio://raw-bucket/temp_file.mp4'",
+      "FFMPEG: Input #0, mov,mp4,m4a, from 'cloudweave://raw-bucket/temp_file.mp4'",
       "FFMPEG:   Duration: 00:03:15.00, start: 0.000000, bitrate: 14210 kb/s",
       "FFMPEG:   Stream #0:0(und): Video: h264 (High) (avc1 / 0x31637661), yuv420p(tv), 1920x1080",
       "FFMPEG:   Stream #0:1(und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo",
@@ -319,7 +320,7 @@ export default function UploadPage() {
       "COMPILE: Writing variant stream segment stream_1080p_002.ts",
       "COMPILE: Generated index manifest playlist_1080p.m3u8",
       "COMPILE: Writing master stream index master.m3u8",
-      "COMPILE: HLS master compilation successful. MinIO destination layout compiled.",
+      "COMPILE: HLS master compilation successful. CloudWeave destination layout compiled.",
     ];
 
     let currentIdx = 0;
@@ -642,7 +643,7 @@ export default function UploadPage() {
               }`}>
                 <div>
                   <span className="text-[9px] font-bold text-gray-500 uppercase">Step 1</span>
-                  <h3 className="text-xs font-bold text-gray-200 mt-0.5">MinIO Chunk Ingest</h3>
+                  <h3 className="text-xs font-bold text-gray-200 mt-0.5">CloudWeave Ingest</h3>
                 </div>
                 {simStep === "upload" ? (
                   <div className="flex flex-col gap-1.5">
@@ -749,7 +750,7 @@ export default function UploadPage() {
                     {uploadProgress > 50 && <div>[API] Sending chunk #3: MD5 hash: 01c23a... ✓ Verified</div>}
                     {uploadProgress > 70 && <div>[API] Sending chunk #4: MD5 hash: b8d3f1... ✓ Verified</div>}
                     {uploadProgress > 90 && <div>[API] Sending chunk #5: MD5 hash: e3c8a9... ✓ Verified</div>}
-                    {uploadProgress >= 100 && <div className="text-emerald-400">[MinIO] Multipart session assembly initiated...</div>}
+                    {uploadProgress >= 100 && <div className="text-emerald-400">[CloudWeave] Multipart session assembly initiated...</div>}
                   </div>
                 )}
 
@@ -779,7 +780,7 @@ export default function UploadPage() {
                   <div className="flex flex-col gap-2">
                     <div className="text-emerald-400 font-bold">✓ PIPELINE INGESTION COMPLETED SUCCESSFULLY</div>
                     <div className="text-gray-400 leading-normal">
-                      Master Playlist URI: <span className="text-white border-b border-dark-border pb-0.5">minio://streamify-storage/hls/${finishedVideoId}/master.m3u8</span>
+                      Master Playlist URI: <span className="text-white border-b border-dark-border pb-0.5">cloudweave://streamify-storage/hls/${finishedVideoId}/master.m3u8</span>
                       <br />Visibility State: <span className="text-white uppercase font-bold">{visibility}</span>
                       <br />Direct Stream URL: <span className="text-white border-b border-dark-border pb-0.5">/watch/${finishedVideoId}</span>
                     </div>

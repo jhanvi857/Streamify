@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"database/sql"
-	"fmt"
-	"log"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -20,14 +22,14 @@ import (
 
 // Config holds environment configurations
 type Config struct {
-	Port         string
-	DBConn       string
-	RedisAddr    string
+	Port          string
+	DBConn        string
+	RedisAddr     string
 	MinIOEndpoint string
-	MinIOKey     string
-	MinIOSecret  string
-	RawBucket    string
-	HLSBucket    string
+	MinIOKey      string
+	MinIOSecret   string
+	RawBucket     string
+	HLSBucket     string
 }
 
 // App holds application state
@@ -55,14 +57,15 @@ type TranscodeTaskPayload struct {
 }
 
 func main() {
+	rawEndpoint := getEnv("CLOUDWEAVE_ENDPOINT", getEnv("S3_ENDPOINT", getEnv("MINIO_ENDPOINT", "127.0.0.1:9000")))
 	cfg := Config{
 		Port:          getEnv("PORT", "8080"),
 		DBConn:        getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
 		RedisAddr:     getEnv("REDIS_ADDR", "127.0.0.1:6379"),
-		MinIOEndpoint: getEnv("MINIO_ENDPOINT", "127.0.0.1:9000"),
-		MinIOKey:      getEnv("MINIO_ROOT_USER", "minioadmin"),
-		MinIOSecret:   getEnv("MINIO_ROOT_PASSWORD", "minioadmin"),
-		RawBucket:     getEnv("MINIO_RAW_BUCKET", "raw-uploads"),
+		MinIOEndpoint: cleanEndpoint(rawEndpoint),
+		MinIOKey:      getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_ACCESS_KEY", getEnv("MINIO_ROOT_USER", "cw_key_streamify"))),
+		MinIOSecret:   getEnv("CLOUDWEAVE_API_KEY", getEnv("S3_SECRET_KEY", getEnv("MINIO_ROOT_PASSWORD", "cw_key_streamify"))),
+		RawBucket:     getEnv("MINIO_RAW_BUCKET", getEnv("S3_BUCKET", "raw-uploads")),
 		HLSBucket:     getEnv("MINIO_HLS_BUCKET", "hls-streams"),
 	}
 
@@ -117,9 +120,12 @@ func main() {
 	api := r.Group("/api")
 	{
 		api.POST("/videos/upload/init", app.handleInitUpload)
+		api.POST("/videos/upload/direct", app.handleDirectUpload)
 		api.POST("/videos/upload/complete", app.handleCompleteUpload)
 		api.GET("/videos", app.handleListVideos)
 		api.GET("/videos/:id", app.handleGetVideo)
+		api.GET("/videos/:id/stream", app.handleStreamVideo)
+		api.GET("/videos/:id/stream/*filepath", app.handleStreamVideo)
 		api.GET("/videos/:id/status", app.handleGetVideoStatus)
 		api.DELETE("/videos/:id", app.handleDeleteVideo)
 	}
@@ -169,11 +175,155 @@ func (app *App) handleInitUpload(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"video_id":     videoID,
-		"upload_url":   presignedURL.String(),
-		"object_name":  objectName,
-		"raw_bucket":   app.Cfg.RawBucket,
+		"video_id":    videoID,
+		"upload_url":  presignedURL.String(),
+		"object_name": objectName,
+		"raw_bucket":  app.Cfg.RawBucket,
 	})
+}
+
+// handleDirectUpload accepts a file stream from client and uploads directly to CloudWeave storage
+func (app *App) handleDirectUpload(c *gin.Context) {
+	fileHeader, err := c.FormFile("file")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing file form field"})
+		return
+	}
+	objectName := c.PostForm("object_name")
+	if objectName == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Missing object_name form field"})
+		return
+	}
+
+	fileStream, err := fileHeader.Open()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to open uploaded file"})
+		return
+	}
+	defer fileStream.Close()
+
+	log.Printf("Streaming raw video %s (%d bytes) directly into CloudWeave storage...", objectName, fileHeader.Size)
+
+	// Stream directly to CloudWeave native REST API (PUT /files/<bucket>/<key>)
+	cloudweaveURL := fmt.Sprintf("http://%s/files/%s/%s", app.Cfg.MinIOEndpoint, app.Cfg.RawBucket, objectName)
+	req, err := http.NewRequestWithContext(c.Request.Context(), "PUT", cloudweaveURL, fileStream)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to prepare CloudWeave request"})
+		return
+	}
+
+	req.ContentLength = fileHeader.Size
+	contentType := fileHeader.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = "video/mp4"
+	}
+	req.Header.Set("Content-Type", contentType)
+
+	if app.Cfg.MinIOKey != "" {
+		req.Header.Set("Authorization", "Bearer "+app.Cfg.MinIOKey)
+		req.Header.Set("X-API-Key", app.Cfg.MinIOKey)
+	}
+
+	client := &http.Client{Timeout: 30 * time.Minute}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("CloudWeave Direct Stream Upload Error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("CloudWeave upload failed: %v", err)})
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		respBody, _ := io.ReadAll(resp.Body)
+		log.Printf("CloudWeave Upload Status Error (%d): %s", resp.StatusCode, string(respBody))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("CloudWeave upload returned status %d", resp.StatusCode)})
+		return
+	}
+
+	// Update PostgreSQL video record minio_manifest_url so it points directly to CloudWeave stream
+	rawVideoUrl := fmt.Sprintf("http://%s/files/%s/%s", app.Cfg.MinIOEndpoint, app.Cfg.RawBucket, objectName)
+	videoID := strings.TrimPrefix(objectName, "raw-")
+	videoID = strings.TrimSuffix(videoID, ".mp4")
+	_, _ = app.DB.Exec("UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", rawVideoUrl, videoID)
+
+	log.Printf("Successfully stored raw video %s in CloudWeave bucket %s", objectName, app.Cfg.RawBucket)
+	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully to CloudWeave"})
+}
+
+// handleStreamVideo proxies video media stream from CloudWeave to HTML5 video element with byte-range support
+func (app *App) handleStreamVideo(c *gin.Context) {
+	id := c.Param("id")
+	subPath := c.Param("filepath")
+
+	var manifestUrl sql.NullString
+	err := app.DB.QueryRow("SELECT minio_manifest_url FROM videos WHERE id = $1", id).Scan(&manifestUrl)
+	if err != nil || !manifestUrl.Valid || manifestUrl.String == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Video stream not found"})
+		return
+	}
+
+	targetUrl := manifestUrl.String
+	// If stored URL is missing /files/ path for CloudWeave native HTTP server, fix path:
+	if !strings.Contains(targetUrl, "/files/") {
+		if strings.Contains(targetUrl, "9000/") {
+			targetUrl = strings.Replace(targetUrl, "9000/", "9000/files/", 1)
+		}
+	}
+
+	if subPath != "" {
+		if idx := strings.LastIndex(targetUrl, "/"); idx != -1 {
+			targetUrl = targetUrl[:idx] + subPath
+		}
+	}
+
+	log.Printf("Proxying video stream for ID %s (subPath: %s) via CloudWeave URL: %s", id, subPath, targetUrl)
+
+	req, err := http.NewRequestWithContext(c.Request.Context(), "GET", targetUrl, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create stream request"})
+		return
+	}
+
+	// Pass CloudWeave authentication headers
+	if app.Cfg.MinIOKey != "" {
+		req.Header.Set("X-API-Key", app.Cfg.MinIOKey)
+		req.Header.Set("Authorization", "Bearer "+app.Cfg.MinIOKey)
+	}
+
+	// Forward Range header if requested by HTML5 video player
+	if rangeHeader := c.GetHeader("Range"); rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("CloudWeave HTTP Stream Fetch Error for %s: %v", targetUrl, err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "CloudWeave stream unreachable"})
+		return
+	}
+	defer resp.Body.Close()
+
+	// Forward CloudWeave headers to browser
+	for key, values := range resp.Header {
+		for _, value := range values {
+			c.Header(key, value)
+		}
+	}
+
+	lowerUrl := strings.ToLower(targetUrl)
+	if strings.HasSuffix(lowerUrl, ".mp4") {
+		c.Header("Content-Type", "video/mp4")
+	} else if strings.HasSuffix(lowerUrl, ".m3u8") {
+		c.Header("Content-Type", "application/x-mpegURL")
+	} else if strings.HasSuffix(lowerUrl, ".ts") {
+		c.Header("Content-Type", "video/MP2T")
+	}
+
+	c.Header("Access-Control-Allow-Origin", "*")
+	c.Status(resp.StatusCode)
+
+	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
 // handleCompleteUpload enqueues a transcode task in Redis (Asynq)
@@ -400,6 +550,12 @@ func getEnv(key, fallback string) string {
 	return fallback
 }
 
+func cleanEndpoint(endpoint string) string {
+	endpoint = strings.TrimPrefix(endpoint, "http://")
+	endpoint = strings.TrimPrefix(endpoint, "https://")
+	return strings.TrimSuffix(endpoint, "/")
+}
+
 // handleGetVideoStatus checks transcode status and progress for a video
 func (app *App) handleGetVideoStatus(c *gin.Context) {
 	id := c.Param("id")
@@ -456,37 +612,13 @@ func ensureBucketsExist(minioClient *minio.Client, buckets ...string) {
 	ctx := context.Background()
 	for _, bucket := range buckets {
 		exists, err := minioClient.BucketExists(ctx, bucket)
-		if err != nil {
-			log.Printf("Error checking MinIO bucket %s: %v", bucket, err)
-			continue
-		}
-		if !exists {
+		if err != nil || !exists {
 			err = minioClient.MakeBucket(ctx, bucket, minio.MakeBucketOptions{})
 			if err != nil {
-				log.Printf("Error creating MinIO bucket %s: %v", bucket, err)
+				log.Printf("Note: CloudWeave bucket %s initialization: %v", bucket, err)
 			} else {
-				log.Printf("Successfully created MinIO bucket: %s", bucket)
+				log.Printf("Successfully initialized CloudWeave bucket: %s", bucket)
 			}
-		}
-
-		// Set public read policy so browser HTML5 player can stream media files without 403 Access Denied errors
-		policy := fmt.Sprintf(`{
-			"Version": "2012-10-17",
-			"Statement": [
-				{
-					"Effect": "Allow",
-					"Principal": {"AWS": ["*"]},
-					"Action": ["s3:GetObject"],
-					"Resource": ["arn:aws:s3:::%s/*"]
-				}
-			]
-		}`, bucket)
-		err = minioClient.SetBucketPolicy(ctx, bucket, policy)
-		if err != nil {
-			log.Printf("Warning: Failed to set public policy for bucket %s: %v", bucket, err)
-		} else {
-			log.Printf("Successfully set public read policy for MinIO bucket: %s", bucket)
 		}
 	}
 }
-

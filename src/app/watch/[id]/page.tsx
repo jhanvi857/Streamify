@@ -7,6 +7,7 @@ import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
 import { fetchVideoByIdFromApi } from "@/lib/api";
+import Hls from "hls.js";
 
 export default function WatchPage() {
   const { id } = useParams();
@@ -29,7 +30,12 @@ export default function WatchPage() {
       if (isPlaying) {
         realVideoRef.current.pause();
       } else {
-        realVideoRef.current.play();
+        const playPromise = realVideoRef.current.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn("Video playback pending or auto-play restricted:", err);
+          });
+        }
       }
     } else {
       setIsPlaying(!isPlaying);
@@ -150,7 +156,9 @@ export default function WatchPage() {
           date: new Date(backendVid.created_at).toLocaleDateString(),
           duration: backendVid.duration || "00:00",
           visibility: backendVid.visibility || "public",
-          minioManifestUrl: backendVid.minio_manifest_url,
+          minioManifestUrl: backendVid.minio_manifest_url
+            ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api"}/videos/${backendVid.id}/stream`
+            : undefined,
         });
       } else if (isLoaded) {
         setVideo(null);
@@ -159,6 +167,36 @@ export default function WatchPage() {
 
     loadVideoDetails();
   }, [id, videos, isLoaded]);
+
+  // HLS & MP4 video player initialization effect
+  useEffect(() => {
+    if (!video?.minioManifestUrl || !realVideoRef.current) return;
+    const videoEl = realVideoRef.current;
+    const manifestUrl = video.minioManifestUrl;
+
+    let hls: Hls | null = null;
+    if (Hls.isSupported() && manifestUrl.includes(".m3u8")) {
+      hls = new Hls({
+        enableWorker: true,
+        lowLatencyMode: true,
+      });
+      hls.loadSource(manifestUrl);
+      hls.attachMedia(videoEl);
+      hls.on(Hls.Events.ERROR, (_event, data) => {
+        if (data.fatal) {
+          videoEl.src = manifestUrl;
+        }
+      });
+    } else {
+      videoEl.src = manifestUrl;
+    }
+
+    return () => {
+      if (hls) {
+        hls.destroy();
+      }
+    };
+  }, [video?.minioManifestUrl]);
 
   // SVG flow ticker
   useEffect(() => {
@@ -503,9 +541,11 @@ export default function WatchPage() {
             <div className="absolute inset-0 flex items-center justify-center bg-neutral-950">
               {video.minioManifestUrl ? (
                 <video
+                  key={video.minioManifestUrl}
                   ref={realVideoRef}
                   src={video.minioManifestUrl}
-                  autoPlay
+                  controls
+                  playsInline
                   className="w-full h-full object-contain cursor-pointer transition-all duration-300"
                   style={{
                     filter: activeQuality === "360p"
@@ -517,6 +557,11 @@ export default function WatchPage() {
                   onClick={toggleRealPlay}
                   onPlay={() => setIsPlaying(true)}
                   onPause={() => setIsPlaying(false)}
+                  onError={() => {
+                    // Suppress false-alarm warning if video is HLS (.m3u8) processed by hls.js
+                    if (video.minioManifestUrl?.includes(".m3u8")) return;
+                    console.warn("Video stream pending or format restricted");
+                  }}
                   onLoadedMetadata={(e) => {
                     if (e.currentTarget.duration && !isNaN(e.currentTarget.duration)) {
                       setRealDuration(e.currentTarget.duration);

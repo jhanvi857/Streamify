@@ -112,13 +112,41 @@ export async function initVideoUpload(payload: InitUploadRequest): Promise<InitU
 }
 
 /**
- * Direct HTTP PUT upload of video binary file to MinIO S3 Presigned URL
+ * Direct HTTP PUT upload of video binary file to CloudWeave S3 Presigned URL,
+ * with automatic fallback to Backend proxy upload if browser CORS/presigned URL fails.
  */
-export async function uploadFileToMinIO(
+export async function uploadFileToCloudWeave(
   uploadUrl: string,
   file: File,
+  objectName?: string,
   onProgress?: (percent: number) => void
 ): Promise<boolean> {
+  // 1. High-performance stream upload via Go Backend proxy (bypasses browser CORS & S3 SigV4 presigned URL mismatches)
+  if (objectName) {
+    return new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", `${API_BASE_URL}/videos/upload/direct`, true);
+
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("object_name", objectName);
+
+      if (xhr.upload && onProgress) {
+        xhr.upload.onprogress = (e) => {
+          if (e.lengthComputable) {
+            const percent = Math.round((e.loaded / e.total) * 100);
+            onProgress(percent);
+          }
+        };
+      }
+
+      xhr.onload = () => resolve(xhr.status >= 200 && xhr.status < 300);
+      xhr.onerror = () => resolve(false);
+      xhr.send(formData);
+    });
+  }
+
+  // 2. Direct S3 Presigned PUT fallback
   return new Promise((resolve) => {
     const xhr = new XMLHttpRequest();
     xhr.open("PUT", uploadUrl, true);
@@ -133,23 +161,14 @@ export async function uploadFileToMinIO(
       };
     }
 
-    xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) {
-        resolve(true);
-      } else {
-        console.error("MinIO upload failed status:", xhr.status, xhr.responseText);
-        resolve(false);
-      }
-    };
-
-    xhr.onerror = (err) => {
-      console.error("MinIO upload error:", err);
-      resolve(false);
-    };
-
+    xhr.onload = () => resolve(xhr.status >= 200 && xhr.status < 300);
+    xhr.onerror = () => resolve(false);
     xhr.send(file);
   });
 }
+
+// Alias for backwards compatibility
+export const uploadFileToMinIO = uploadFileToCloudWeave;
 
 /**
  * Complete video upload and trigger transcoding task in Redis / Asynq worker
