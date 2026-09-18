@@ -16,20 +16,30 @@ export function useVideos() {
       const backendVideos = await fetchVideosFromApi();
       if (backendVideos && backendVideos.length > 0) {
         const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api";
-        const loaded: Video[] = backendVideos.map((bv: BackendVideo) => ({
-          id: bv.id,
-          title: bv.title,
-          description: bv.description || "",
-          tag: (bv.category as Video["tag"]) || "system design",
-          author: bv.author_name || "Anonymous",
-          views: `${bv.views_count || 0} views`,
-          date: new Date(bv.created_at).toLocaleDateString(),
-          duration: bv.duration || "00:00",
-          visibility: bv.visibility || "public",
-          minioManifestUrl: bv.minio_manifest_url
-            ? `${apiBaseUrl}/videos/${bv.id}/stream`
-            : undefined,
-        }));
+        const loaded: Video[] = backendVideos.map((bv: BackendVideo) => {
+          const rawUrl = bv.manifest_url || bv.minio_manifest_url;
+          const streamUrl = rawUrl
+            ? `${apiBaseUrl}/videos/${bv.id}/stream${
+                rawUrl.includes("master.m3u8") || rawUrl.startsWith("hls/")
+                  ? "/master.m3u8"
+                  : ""
+              }`
+            : undefined;
+
+          return {
+            id: bv.id,
+            title: bv.title,
+            description: bv.description || "",
+            tag: (bv.category as Video["tag"]) || "system design",
+            author: bv.author_name || "Anonymous",
+            views: `${bv.views_count || 0} views`,
+            date: new Date(bv.created_at).toLocaleDateString(),
+            duration: bv.duration || "00:00",
+            visibility: bv.visibility || "public",
+            manifestUrl: streamUrl,
+            minioManifestUrl: streamUrl,
+          };
+        });
 
         setVideos(loaded);
         setIsLoaded(true);

@@ -10,6 +10,7 @@ export interface BackendVideo {
   visibility: "public" | "private";
   author_id: string | null;
   author_name?: string;
+  manifest_url?: string;
   minio_manifest_url?: string;
   duration: string;
   views_count: number;
@@ -91,7 +92,7 @@ export async function deleteVideoFromApi(id: string): Promise<boolean> {
 }
 
 /**
- * Initialize video upload session in Go backend (creates PG entry & gets MinIO presigned URL)
+ * Initialize video upload session in Go backend (creates PG entry & gets S3 presigned URL)
  */
 export async function initVideoUpload(payload: InitUploadRequest): Promise<InitUploadResponse | null> {
   try {
@@ -112,16 +113,16 @@ export async function initVideoUpload(payload: InitUploadRequest): Promise<InitU
 }
 
 /**
- * Direct HTTP PUT upload of video binary file to CloudWeave S3 Presigned URL,
- * with automatic fallback to Backend proxy upload if browser CORS/presigned URL fails.
+ * Direct HTTP PUT upload of video binary file to S3-compatible storage (CloudWeave in dev, Neon / AWS S3 in prod),
+ * with stream proxy upload fallback via the Go backend.
  */
-export async function uploadFileToCloudWeave(
+export async function uploadFileToStorage(
   uploadUrl: string,
   file: File,
   objectName?: string,
   onProgress?: (percent: number) => void
 ): Promise<boolean> {
-  // 1. High-performance stream upload via Go Backend proxy (bypasses browser CORS & S3 SigV4 presigned URL mismatches)
+  // 1. High-performance stream upload via Go Backend proxy
   if (objectName) {
     return new Promise((resolve) => {
       const xhr = new XMLHttpRequest();
@@ -167,8 +168,8 @@ export async function uploadFileToCloudWeave(
   });
 }
 
-// Alias for backwards compatibility
-export const uploadFileToMinIO = uploadFileToCloudWeave;
+// Aliases for compatibility
+export const uploadFileToCloudWeave = uploadFileToStorage;
 
 /**
  * Complete video upload and trigger transcoding task in Redis / Asynq worker
@@ -196,6 +197,7 @@ export interface TranscodeStatusResponse {
   status: "pending" | "processing" | "completed" | "failed";
   progress: number;
   error_message?: string;
+  manifest_url?: string;
   minio_manifest_url?: string;
 }
 

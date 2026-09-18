@@ -20,6 +20,7 @@ export interface Video {
   description: string;
   progress?: number; // Watched percentage, e.g., 35
   visibility: 'public' | 'private';
+  manifestUrl?: string;
   minioManifestUrl?: string;
   systemDesign?: SystemDesignContent;
 }
