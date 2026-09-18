@@ -60,17 +60,20 @@ type TranscodeTaskPayload struct {
 func main() {
 	loadEnv()
 
-	rawEndpoint := getEnv("S3_ENDPOINT", getEnv("CLOUDWEAVE_ENDPOINT", "127.0.0.1:9000"))
-	useSSL := getEnv("S3_USE_SSL", "false") == "true" || strings.HasPrefix(rawEndpoint, "https://")
+	rawEndpoint := getValidEnv("S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "CLOUDWEAVE_ENDPOINT")
+	if rawEndpoint == "" {
+		rawEndpoint = "127.0.0.1:9000"
+	}
+	useSSL := getEnv("S3_USE_SSL", "false") == "true" || strings.HasPrefix(rawEndpoint, "https://") || strings.Contains(rawEndpoint, "neon.tech")
 
 	cfg := Config{
 		Port:        getEnv("PORT", "8080"),
 		DBConn:      getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
 		RedisAddr:   getEnv("REDIS_ADDR", "127.0.0.1:6379"),
 		S3Endpoint:  cleanEndpoint(rawEndpoint),
-		S3AccessKey: getEnv("S3_ACCESS_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
-		S3SecretKey: getEnv("S3_SECRET_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
-		S3Region:    getEnv("S3_REGION", "us-east-1"),
+		S3AccessKey: getValidEnv("S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "CLOUDWEAVE_API_KEY", "master-secret-key"),
+		S3SecretKey: getValidEnv("S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "CLOUDWEAVE_API_KEY", "master-secret-key"),
+		S3Region:    getValidEnv("S3_REGION", "AWS_REGION", "us-east-1"),
 		S3UseSSL:    useSSL,
 		RawBucket:   getEnv("S3_RAW_BUCKET", "raw-uploads"),
 		HLSBucket:   getEnv("S3_HLS_BUCKET", "hls-streams"),
@@ -116,7 +119,7 @@ func main() {
 	ensureBucketsExist(s3Client, cfg.RawBucket, cfg.HLSBucket)
 
 	// 3. Initialize Asynq client
-	asynqClient := asynq.NewClient(asynq.RedisClientOpt{Addr: cfg.RedisAddr})
+	asynqClient := asynq.NewClient(parseRedisOpt(cfg.RedisAddr))
 	defer asynqClient.Close()
 
 	app := &App{
@@ -294,7 +297,7 @@ func (app *App) handleDirectUpload(c *gin.Context) {
 	videoID := strings.TrimPrefix(objectName, "raw-")
 	videoID = strings.TrimSuffix(videoID, ".mp4")
 	rawVideoUrl := fmt.Sprintf("raw/%s", objectName)
-	_, _ = app.DB.Exec("UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", rawVideoUrl, videoID)
+	_, _ = app.DB.Exec("UPDATE videos SET manifest_url=$1 WHERE id=$2", rawVideoUrl, videoID)
 
 	log.Printf("Successfully stored raw video %s in S3 bucket %s", objectName, app.Cfg.RawBucket)
 	c.JSON(http.StatusOK, gin.H{"message": "File uploaded successfully to storage"})
@@ -306,7 +309,7 @@ func (app *App) handleStreamVideo(c *gin.Context) {
 	subPath := c.Param("filepath")
 
 	var manifestUrl sql.NullString
-	err := app.DB.QueryRow("SELECT minio_manifest_url FROM videos WHERE id = $1", id).Scan(&manifestUrl)
+	err := app.DB.QueryRow("SELECT manifest_url FROM videos WHERE id = $1", id).Scan(&manifestUrl)
 	if err != nil || !manifestUrl.Valid || manifestUrl.String == "" {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Video stream not found"})
 		return
@@ -427,7 +430,7 @@ func (app *App) handleCompleteUpload(c *gin.Context) {
 // handleListVideos returns all public video metadata
 func (app *App) handleListVideos(c *gin.Context) {
 	rows, err := app.DB.Query(`
-		SELECT v.id, v.title, v.description, v.category, v.visibility, COALESCE(u.name, 'Anonymous') AS author_name, v.minio_manifest_url, v.duration, v.views_count, v.created_at 
+		SELECT v.id, v.title, v.description, v.category, v.visibility, COALESCE(u.name, 'Anonymous') AS author_name, v.manifest_url, v.duration, v.views_count, v.created_at 
 		FROM videos v
 		LEFT JOIN "user" u ON v.author_id = u.id
 		WHERE v.visibility = 'public' 
@@ -441,17 +444,16 @@ func (app *App) handleListVideos(c *gin.Context) {
 	defer rows.Close()
 
 	type VideoResponse struct {
-		ID               string    `json:"id"`
-		Title            string    `json:"title"`
-		Description      string    `json:"description"`
-		Category         string    `json:"category"`
-		Visibility       string    `json:"visibility"`
-		AuthorName       string    `json:"author_name"`
-		ManifestURL      string    `json:"manifest_url"`
-		MinioManifestURL string    `json:"minio_manifest_url,omitempty"`
-		Duration         string    `json:"duration"`
-		ViewsCount       int       `json:"views_count"`
-		CreatedAt        time.Time `json:"created_at"`
+		ID          string    `json:"id"`
+		Title       string    `json:"title"`
+		Description string    `json:"description"`
+		Category    string    `json:"category"`
+		Visibility  string    `json:"visibility"`
+		AuthorName  string    `json:"author_name"`
+		ManifestURL string    `json:"manifest_url"`
+		Duration    string    `json:"duration"`
+		ViewsCount  int       `json:"views_count"`
+		CreatedAt   time.Time `json:"created_at"`
 	}
 
 	videos := []VideoResponse{}
@@ -465,7 +467,6 @@ func (app *App) handleListVideos(c *gin.Context) {
 		}
 		if manifest.Valid {
 			v.ManifestURL = manifest.String
-			v.MinioManifestURL = manifest.String
 		}
 		videos = append(videos, v)
 	}
@@ -478,22 +479,21 @@ func (app *App) handleGetVideo(c *gin.Context) {
 	id := c.Param("id")
 
 	var v struct {
-		ID               string    `json:"id"`
-		Title            string    `json:"title"`
-		Description      string    `json:"description"`
-		Category         string    `json:"category"`
-		Visibility       string    `json:"visibility"`
-		AuthorName       string    `json:"author_name"`
-		ManifestURL      string    `json:"manifest_url"`
-		MinioManifestURL string    `json:"minio_manifest_url,omitempty"`
-		Duration         string    `json:"duration"`
-		ViewsCount       int       `json:"views_count"`
-		CreatedAt        time.Time `json:"created_at"`
+		ID          string    `json:"id"`
+		Title       string    `json:"title"`
+		Description string    `json:"description"`
+		Category    string    `json:"category"`
+		Visibility  string    `json:"visibility"`
+		AuthorName  string    `json:"author_name"`
+		ManifestURL string    `json:"manifest_url"`
+		Duration    string    `json:"duration"`
+		ViewsCount  int       `json:"views_count"`
+		CreatedAt   time.Time `json:"created_at"`
 	}
 
 	var manifest sql.NullString
 	query := `
-		SELECT v.id, v.title, v.description, v.category, v.visibility, COALESCE(u.name, 'Anonymous') AS author_name, v.minio_manifest_url, v.duration, v.views_count, v.created_at 
+		SELECT v.id, v.title, v.description, v.category, v.visibility, COALESCE(u.name, 'Anonymous') AS author_name, v.manifest_url, v.duration, v.views_count, v.created_at 
 		FROM videos v
 		LEFT JOIN "user" u ON v.author_id = u.id
 		WHERE v.id = $1
@@ -511,7 +511,6 @@ func (app *App) handleGetVideo(c *gin.Context) {
 
 	if manifest.Valid {
 		v.ManifestURL = manifest.String
-		v.MinioManifestURL = manifest.String
 	}
 
 	c.JSON(http.StatusOK, v)
@@ -607,7 +606,7 @@ func (app *App) handleGetVideoStatus(c *gin.Context) {
 	var manifestUrl sql.NullString
 
 	query := `
-		SELECT j.status, j.progress, j.error_message, v.minio_manifest_url
+		SELECT j.status, j.progress, j.error_message, v.manifest_url
 		FROM transcode_jobs j
 		JOIN videos v ON j.video_id = v.id
 		WHERE j.video_id = $1
@@ -644,7 +643,6 @@ func (app *App) handleGetVideoStatus(c *gin.Context) {
 	}
 	if manifestUrl.Valid {
 		resp["manifest_url"] = manifestUrl.String
-		resp["minio_manifest_url"] = manifestUrl.String
 	}
 
 	c.JSON(http.StatusOK, resp)
@@ -728,4 +726,38 @@ func loadEnv() {
 			}
 		}
 	}
+}
+
+// parseRedisOpt parses either host:port, redis://, rediss://, or "redis-cli ... -u <url>"
+func parseRedisOpt(raw string) asynq.RedisConnOpt {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, `"'`)
+	hasTLS := strings.Contains(raw, "--tls") || strings.HasPrefix(raw, "rediss://")
+	if idx := strings.Index(raw, "rediss://"); idx != -1 {
+		raw = raw[idx:]
+	} else if idx := strings.Index(raw, "redis://"); idx != -1 {
+		raw = raw[idx:]
+		if hasTLS {
+			raw = "rediss://" + strings.TrimPrefix(raw, "redis://")
+		}
+	}
+	if strings.HasPrefix(raw, "redis://") || strings.HasPrefix(raw, "rediss://") {
+		opt, err := asynq.ParseRedisURI(raw)
+		if err == nil {
+			return opt
+		}
+	}
+	return asynq.RedisClientOpt{Addr: raw}
+}
+
+// getValidEnv returns the first non-empty, non-placeholder environment variable value
+func getValidEnv(keys ...string) string {
+	for _, key := range keys {
+		val := strings.TrimSpace(os.Getenv(key))
+		val = strings.Trim(val, `"'`)
+		if val != "" && !strings.HasPrefix(val, "<") && !strings.HasSuffix(val, ">") {
+			return val
+		}
+	}
+	return ""
 }

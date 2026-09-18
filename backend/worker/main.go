@@ -49,16 +49,19 @@ type Worker struct {
 func main() {
 	loadEnv()
 
-	rawEndpoint := getEnv("S3_ENDPOINT", getEnv("CLOUDWEAVE_ENDPOINT", "127.0.0.1:9000"))
-	useSSL := getEnv("S3_USE_SSL", "false") == "true" || strings.HasPrefix(rawEndpoint, "https://")
+	rawEndpoint := getValidEnv("S3_ENDPOINT", "AWS_ENDPOINT_URL_S3", "CLOUDWEAVE_ENDPOINT")
+	if rawEndpoint == "" {
+		rawEndpoint = "127.0.0.1:9000"
+	}
+	useSSL := getEnv("S3_USE_SSL", "false") == "true" || strings.HasPrefix(rawEndpoint, "https://") || strings.Contains(rawEndpoint, "neon.tech")
 
 	cfg := Config{
 		DBConn:      getEnv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/streamify?sslmode=disable"),
 		RedisAddr:   getEnv("REDIS_ADDR", "127.0.0.1:6379"),
 		S3Endpoint:  cleanEndpoint(rawEndpoint),
-		S3AccessKey: getEnv("S3_ACCESS_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
-		S3SecretKey: getEnv("S3_SECRET_KEY", getEnv("CLOUDWEAVE_API_KEY", "master-secret-key")),
-		S3Region:    getEnv("S3_REGION", "us-east-1"),
+		S3AccessKey: getValidEnv("S3_ACCESS_KEY", "AWS_ACCESS_KEY_ID", "CLOUDWEAVE_API_KEY", "master-secret-key"),
+		S3SecretKey: getValidEnv("S3_SECRET_KEY", "AWS_SECRET_ACCESS_KEY", "CLOUDWEAVE_API_KEY", "master-secret-key"),
+		S3Region:    getValidEnv("S3_REGION", "AWS_REGION", "us-east-1"),
 		S3UseSSL:    useSSL,
 		RawBucket:   getEnv("S3_RAW_BUCKET", "raw-uploads"),
 		HLSBucket:   getEnv("S3_HLS_BUCKET", "hls-streams"),
@@ -75,9 +78,14 @@ func main() {
 	if err := db.Ping(); err != nil {
 		log.Printf("Warning: Worker database ping failed (%v). Check DATABASE_URL in .env", err)
 	} else {
-		var currentDB string
-		_ = db.QueryRow("SELECT current_database()").Scan(&currentDB)
-		log.Printf("Worker connected to PostgreSQL successfully! Database: %s", currentDB)
+		var currentDB, version string
+		_ = db.QueryRow("SELECT current_database(), version()").Scan(&currentDB, &version)
+		isNeon := strings.Contains(strings.ToLower(version), "neon") || strings.Contains(cfg.DBConn, "neon.tech")
+		if isNeon {
+			log.Printf("Worker connected to Neon PostgreSQL (Cloud) successfully! Database: %s", currentDB)
+		} else {
+			log.Printf("Worker connected to PostgreSQL successfully! Database: %s", currentDB)
+		}
 	}
 
 	// Auto-provision PostgreSQL schema if running against fresh DB (e.g. Neon in production)
@@ -108,7 +116,7 @@ func main() {
 
 	// 4. Initialize Asynq Server
 	srv := asynq.NewServer(
-		asynq.RedisClientOpt{Addr: cfg.RedisAddr},
+		parseRedisOpt(cfg.RedisAddr),
 		asynq.Config{
 			Concurrency: 4, // Up to 4 parallel transcode threads
 			Queues: map[string]int{
@@ -229,7 +237,7 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 		rawVideoUrl := fmt.Sprintf("raw/%s", rawObjectName)
 		
 		_, _ = w.DB.Exec(
-			"UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", 
+			"UPDATE videos SET manifest_url=$1 WHERE id=$2", 
 			rawVideoUrl, payload.VideoID,
 		)
 		w.updateJobProgress(payload.VideoID, 100)
@@ -296,7 +304,7 @@ func (w *Worker) HandleTranscodeTask(ctx context.Context, t *asynq.Task) error {
 	defer tx.Rollback()
 
 	// Update video source link
-	_, err = tx.ExecContext(ctx, "UPDATE videos SET minio_manifest_url=$1 WHERE id=$2", hlsUrl, payload.VideoID)
+	_, err = tx.ExecContext(ctx, "UPDATE videos SET manifest_url=$1 WHERE id=$2", hlsUrl, payload.VideoID)
 	if err != nil {
 		w.failJob(payload.VideoID, "Failed to update video record URL")
 		return err
@@ -425,3 +433,36 @@ func loadEnv() {
 	}
 }
 
+// parseRedisOpt parses either host:port, redis://, rediss://, or "redis-cli ... -u <url>"
+func parseRedisOpt(raw string) asynq.RedisConnOpt {
+	raw = strings.TrimSpace(raw)
+	raw = strings.Trim(raw, `"'`)
+	hasTLS := strings.Contains(raw, "--tls") || strings.HasPrefix(raw, "rediss://")
+	if idx := strings.Index(raw, "rediss://"); idx != -1 {
+		raw = raw[idx:]
+	} else if idx := strings.Index(raw, "redis://"); idx != -1 {
+		raw = raw[idx:]
+		if hasTLS {
+			raw = "rediss://" + strings.TrimPrefix(raw, "redis://")
+		}
+	}
+	if strings.HasPrefix(raw, "redis://") || strings.HasPrefix(raw, "rediss://") {
+		opt, err := asynq.ParseRedisURI(raw)
+		if err == nil {
+			return opt
+		}
+	}
+	return asynq.RedisClientOpt{Addr: raw}
+}
+
+// getValidEnv returns the first non-empty, non-placeholder environment variable value
+func getValidEnv(keys ...string) string {
+	for _, key := range keys {
+		val := strings.TrimSpace(os.Getenv(key))
+		val = strings.Trim(val, `"'`)
+		if val != "" && !strings.HasPrefix(val, "<") && !strings.HasSuffix(val, ">") {
+			return val
+		}
+	}
+	return ""
+}
