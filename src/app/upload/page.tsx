@@ -127,7 +127,7 @@ export default function UploadPage() {
 
     const authorId = session?.user?.id || "anonymous-user";
 
-    // Step 1: Initialize Upload in Go API & MinIO
+    // Step 1: Initialize Upload in Go API & S3 Storage
     const initRes = await initVideoUpload({
       title,
       description,
@@ -228,7 +228,7 @@ export default function UploadPage() {
         setGeneratedManifests([
           "COMPILE: HLS master playlist and video segments built.",
           "COMPILE: Uploaded HLS playlists & TS chunks to CloudWeave destination bucket.",
-          `HLS URL: ${statusRes.minio_manifest_url || "CloudWeave HLS Stream Ready"}`,
+          `HLS URL: ${statusRes.manifest_url || statusRes.minio_manifest_url || "CloudWeave HLS Stream Ready"}`,
         ]);
 
         setTimeout(() => {
@@ -653,7 +653,7 @@ export default function UploadPage() {
                     <span className="text-[9px] font-bold font-mono text-brand-red">{uploadProgress}% uploaded</span>
                   </div>
                 ) : uploadProgress >= 100 ? (
-                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">✓ Complete</span>
+                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">Complete</span>
                 ) : (
                   <span className="text-[9px] text-gray-600">Pending</span>
                 )}
@@ -674,7 +674,7 @@ export default function UploadPage() {
                 {simStep === "redis" ? (
                   <span className="text-[9.5px] font-bold text-orange-400 animate-pulse uppercase tracking-wider">Enqueueing job...</span>
                 ) : simStep !== "upload" ? (
-                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">✓ Enqueued</span>
+                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">Enqueued</span>
                 ) : (
                   <span className="text-[9px] text-gray-600">Pending</span>
                 )}
@@ -703,7 +703,7 @@ export default function UploadPage() {
                     </div>
                   </div>
                 ) : simStep === "manifest" || simStep === "completed" ? (
-                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">✓ Transcoded</span>
+                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">Transcoded</span>
                 ) : (
                   <span className="text-[9px] text-gray-600">Pending</span>
                 )}
@@ -724,7 +724,7 @@ export default function UploadPage() {
                 {simStep === "manifest" ? (
                   <span className="text-[9.5px] font-bold text-pink-400 animate-pulse uppercase tracking-wide">Compiling m3u8...</span>
                 ) : simStep === "completed" ? (
-                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">✓ Packed & Signed</span>
+                  <span className="text-[9.5px] font-bold text-emerald-500 flex items-center gap-1">Packed & Signed</span>
                 ) : (
                   <span className="text-[9px] text-gray-600">Pending</span>
                 )}
@@ -745,11 +745,11 @@ export default function UploadPage() {
                 {simStep === "upload" && (
                   <div className="flex flex-col gap-1">
                     <div>[API] Chunking file into 5 pieces of ~2.4MB each...</div>
-                    {uploadProgress > 10 && <div>[API] Sending chunk #1: MD5 hash: 8ab2f3... ✓ Verified</div>}
-                    {uploadProgress > 30 && <div>[API] Sending chunk #2: MD5 hash: f193d2... ✓ Verified</div>}
-                    {uploadProgress > 50 && <div>[API] Sending chunk #3: MD5 hash: 01c23a... ✓ Verified</div>}
-                    {uploadProgress > 70 && <div>[API] Sending chunk #4: MD5 hash: b8d3f1... ✓ Verified</div>}
-                    {uploadProgress > 90 && <div>[API] Sending chunk #5: MD5 hash: e3c8a9... ✓ Verified</div>}
+                    {uploadProgress > 10 && <div>[API] Sending chunk #1: MD5 hash: 8ab2f3... Verified</div>}
+                    {uploadProgress > 30 && <div>[API] Sending chunk #2: MD5 hash: f193d2... Verified</div>}
+                    {uploadProgress > 50 && <div>[API] Sending chunk #3: MD5 hash: 01c23a... Verified</div>}
+                    {uploadProgress > 70 && <div>[API] Sending chunk #4: MD5 hash: b8d3f1... Verified</div>}
+                    {uploadProgress > 90 && <div>[API] Sending chunk #5: MD5 hash: e3c8a9... Verified</div>}
                     {uploadProgress >= 100 && <div className="text-emerald-400">[CloudWeave] Multipart session assembly initiated...</div>}
                   </div>
                 )}
@@ -778,7 +778,7 @@ export default function UploadPage() {
                 {/* Completed logs */}
                 {simStep === "completed" && (
                   <div className="flex flex-col gap-2">
-                    <div className="text-emerald-400 font-bold">✓ PIPELINE INGESTION COMPLETED SUCCESSFULLY</div>
+                    <div className="text-emerald-400 font-bold">[OK] PIPELINE INGESTION COMPLETED SUCCESSFULLY</div>
                     <div className="text-gray-400 leading-normal">
                       Master Playlist URI: <span className="text-white border-b border-dark-border pb-0.5">cloudweave://streamify-storage/hls/${finishedVideoId}/master.m3u8</span>
                       <br />Visibility State: <span className="text-white uppercase font-bold">{visibility}</span>
