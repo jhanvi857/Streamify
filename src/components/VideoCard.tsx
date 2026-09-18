@@ -108,10 +108,10 @@ export default function VideoCard({ video, onDelete }: VideoCardProps) {
         <div className="relative aspect-video w-full bg-black overflow-hidden flex items-center justify-center">
           
           {/* 1. Real Video Snapshot & Silent Hover Preview */}
-          {(video.manifestUrl || video.minioManifestUrl) && (
+          {video.manifestUrl && (
             <video
               ref={videoPreviewRef}
-              src={`${video.manifestUrl || video.minioManifestUrl}#t=0.5`}
+              src={`${video.manifestUrl}#t=0.5`}
               preload="metadata"
               muted
               playsInline

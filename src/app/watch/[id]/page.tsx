@@ -215,7 +215,7 @@ export default function WatchPage() {
       // 2. Fetch from Go Backend API
       const backendVid = await fetchVideoByIdFromApi(targetId);
       if (backendVid) {
-        const streamRaw = backendVid.manifest_url || backendVid.minio_manifest_url;
+        const streamRaw = backendVid.manifest_url;
         const streamFull = streamRaw
           ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api"}/videos/${backendVid.id}/stream${
               streamRaw.includes("master.m3u8") || streamRaw.startsWith("hls/")
@@ -235,7 +235,6 @@ export default function WatchPage() {
           duration: backendVid.duration || "00:00",
           visibility: backendVid.visibility || "public",
           manifestUrl: streamFull,
-          minioManifestUrl: streamFull,
         });
       } else if (isLoaded) {
         setVideo(null);
@@ -246,7 +245,7 @@ export default function WatchPage() {
   }, [id, videos, isLoaded]);
 
   // HLS & MP4 video player initialization effect
-  const activeStreamUrl = video?.manifestUrl || video?.minioManifestUrl;
+  const activeStreamUrl = video?.manifestUrl;
   useEffect(() => {
     if (!activeStreamUrl || !realVideoRef.current) return;
     const videoEl = realVideoRef.current;
@@ -622,11 +621,11 @@ export default function WatchPage() {
           >
             {/* Player Canvas Display */}
             <div className="absolute inset-0 flex items-center justify-center bg-neutral-950">
-              {(video.manifestUrl || video.minioManifestUrl) ? (
+              {video.manifestUrl ? (
                 <video
-                  key={video.manifestUrl || video.minioManifestUrl}
+                  key={video.manifestUrl}
                   ref={realVideoRef}
-                  src={video.manifestUrl || video.minioManifestUrl}
+                  src={video.manifestUrl}
                   playsInline
                   className="w-full h-full object-contain pointer-events-none transition-all duration-300"
                   style={{
@@ -641,7 +640,7 @@ export default function WatchPage() {
                   onPause={() => setIsPlaying(false)}
                   onError={() => {
                     // Suppress false-alarm warning if video is HLS (.m3u8) processed by hls.js
-                    if ((video.manifestUrl || video.minioManifestUrl)?.includes(".m3u8")) return;
+                    if (video.manifestUrl?.includes(".m3u8")) return;
                     console.warn("Video stream pending or format restricted");
                   }}
                   onLoadedMetadata={(e) => {

@@ -228,7 +228,7 @@ export default function UploadPage() {
         setGeneratedManifests([
           "COMPILE: HLS master playlist and video segments built.",
           "COMPILE: Uploaded HLS playlists & TS chunks to CloudWeave destination bucket.",
-          `HLS URL: ${statusRes.manifest_url || statusRes.minio_manifest_url || "CloudWeave HLS Stream Ready"}`,
+          `HLS URL: ${statusRes.manifest_url || "CloudWeave HLS Stream Ready"}`,
         ]);
 
         setTimeout(() => {

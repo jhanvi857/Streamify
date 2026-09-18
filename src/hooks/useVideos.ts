@@ -17,7 +17,7 @@ export function useVideos() {
       if (backendVideos && backendVideos.length > 0) {
         const apiBaseUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api";
         const loaded: Video[] = backendVideos.map((bv: BackendVideo) => {
-          const rawUrl = bv.manifest_url || bv.minio_manifest_url;
+          const rawUrl = bv.manifest_url;
           const streamUrl = rawUrl
             ? `${apiBaseUrl}/videos/${bv.id}/stream${
                 rawUrl.includes("master.m3u8") || rawUrl.startsWith("hls/")
@@ -37,7 +37,6 @@ export function useVideos() {
             duration: bv.duration || "00:00",
             visibility: bv.visibility || "public",
             manifestUrl: streamUrl,
-            minioManifestUrl: streamUrl,
           };
         });
 

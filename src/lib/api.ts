@@ -11,7 +11,6 @@ export interface BackendVideo {
   author_id: string | null;
   author_name?: string;
   manifest_url?: string;
-  minio_manifest_url?: string;
   duration: string;
   views_count: number;
   created_at: string;
@@ -198,7 +197,6 @@ export interface TranscodeStatusResponse {
   progress: number;
   error_message?: string;
   manifest_url?: string;
-  minio_manifest_url?: string;
 }
 
 /**
