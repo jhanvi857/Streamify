@@ -220,7 +220,6 @@ func main() {
 			"database": "connected",
 		})
 	})
-	r.GET("/health", healthHandler)
 
 	// Register video routes on both "/api" and root "" so requests succeed
 	// whether NEXT_PUBLIC_API_URL ends in /api or not
