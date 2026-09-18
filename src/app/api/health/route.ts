@@ -12,7 +12,7 @@ export async function GET() {
 
   const pool = new Pool({
     connectionString,
-    ssl: isNeon ? { rejectUnauthorized: false } : undefined,
+    ssl: isNeon ? { rejectUnauthorized: true } : undefined,
   });
 
   try {
