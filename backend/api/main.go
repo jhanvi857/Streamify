@@ -162,11 +162,18 @@ func main() {
 	defer srv.Shutdown()
 
 	// 6. Setup Router
+	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
 	// CORS middleware
 	r.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
+		allowedOrigin := os.Getenv("FRONTEND_ORIGIN") // e.g. https://your-app.vercel.app
+		origin := c.Request.Header.Get("Origin")
+		if origin != "" {
+			if allowedOrigin == "" || origin == allowedOrigin || origin == "http://localhost:3000" || origin == "http://127.0.0.1:3000" {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+			}
+		}
 		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
 		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization, accept, origin, Cache-Control, X-Requested-With, Range")
 		c.Writer.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS, GET, PUT, DELETE, HEAD")
@@ -403,7 +410,6 @@ func (app *App) handleStreamVideo(c *gin.Context) {
 	if contentType != "" {
 		c.Header("Content-Type", contentType)
 	}
-	c.Header("Access-Control-Allow-Origin", "*")
 
 	// Standard Go http.ServeContent handles Range headers (206 Partial Content),
 	// Content-Range, Content-Length, HEAD requests, and browser seeking seamlessly.
