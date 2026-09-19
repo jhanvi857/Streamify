@@ -571,9 +571,12 @@ export default function WatchPage() {
 
   if (!isLoaded) {
     return (
-      <div className="min-h-screen bg-dark-base text-gray-100 flex flex-col items-center justify-center">
+      <div className="min-h-screen bg-dark-base text-gray-100 flex flex-col items-center justify-center px-4 text-center">
         <div className="h-8 w-8 border-4 border-brand-red border-t-transparent rounded-full animate-spin" />
-        <span className="mt-4 text-xs font-semibold text-gray-400">Loading lesson workspace...</span>
+        <span className="mt-4 text-xs font-semibold text-gray-300">Loading video workspace...</span>
+        <span className="mt-1 text-[11px] text-gray-500 max-w-xs">
+          If backend was idle, Render takes 20-30s to boot. Video will start automatically.
+        </span>
       </div>
     );
   }

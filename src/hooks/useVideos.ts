@@ -5,15 +5,45 @@ import { Video, defaultVideos } from "@/data/videos";
 import { fetchVideosFromApi, deleteVideoFromApi, BackendVideo } from "@/lib/api";
 
 const LOCAL_STORAGE_KEY = "streamify_videos";
+const CACHED_FEED_KEY = "streamify_cached_feed";
 
 export function useVideos() {
   const [videos, setVideos] = useState<Video[]>([]);
   const [isLoaded, setIsLoaded] = useState(false);
+  const [isServerWakingUp, setIsServerWakingUp] = useState(false);
 
+  // Initialize cached videos from localStorage immediately if available (0ms cold start latency)
   useEffect(() => {
-    async function loadVideos() {
-      // 1. Fetch real videos from Go Backend API
-      const backendVideos = await fetchVideosFromApi();
+    if (typeof window !== "undefined") {
+      try {
+        const cached = localStorage.getItem(CACHED_FEED_KEY);
+        if (cached) {
+          const parsed = JSON.parse(cached) as Video[];
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setVideos(parsed);
+          }
+        }
+      } catch (e) {
+        console.warn("Failed to load cached feed from localStorage", e);
+      }
+    }
+  }, []);
+
+  const loadVideos = async () => {
+    // Flag cold start waking if request takes more than 1.5 seconds
+    const coldStartTimer = setTimeout(() => {
+      setIsServerWakingUp(true);
+    }, 1500);
+
+    try {
+      // 1. Fetch real videos from Go Backend API with cold start retries
+      const backendVideos = await fetchVideosFromApi(4, 2500, () => {
+        setIsServerWakingUp(true);
+      });
+
+      clearTimeout(coldStartTimer);
+      setIsServerWakingUp(false);
+
       if (backendVideos && backendVideos.length > 0) {
         const apiBaseUrl = (process.env.NEXT_PUBLIC_API_URL || "http://localhost:8080/api").replace(/\/+$/, "");
         const loaded: Video[] = backendVideos.map((bv: BackendVideo) => {
@@ -42,8 +72,14 @@ export function useVideos() {
 
         setVideos(loaded);
         setIsLoaded(true);
+
+        // Cache loaded videos in localStorage for instant rendering on future visits
         if (typeof window !== "undefined") {
-          localStorage.removeItem(LOCAL_STORAGE_KEY);
+          try {
+            localStorage.setItem(CACHED_FEED_KEY, JSON.stringify(loaded));
+          } catch (e) {
+            console.warn("Failed to save feed cache", e);
+          }
         }
         return;
       }
@@ -66,12 +102,23 @@ export function useVideos() {
         }
       }
 
-      setVideos(currentList);
+      setVideos((prev) => (prev.length > 0 ? prev : currentList));
+      setIsLoaded(true);
+    } catch (err) {
+      clearTimeout(coldStartTimer);
+      setIsServerWakingUp(false);
       setIsLoaded(true);
     }
+  };
 
+  useEffect(() => {
     loadVideos();
   }, []);
+
+  const refreshVideos = async () => {
+    setIsLoaded(false);
+    await loadVideos();
+  };
 
   const addVideo = (newVideo: Video) => {
     const updated = [newVideo, ...videos];
@@ -81,12 +128,21 @@ export function useVideos() {
         (v) => !defaultVideos.some((dv) => dv.id === v.id)
       );
       localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(customVideos));
+      localStorage.setItem(CACHED_FEED_KEY, JSON.stringify(updated));
     }
   };
 
   const deleteVideo = async (id: string) => {
     // 1. Remove from React state immediately for snappy UI
-    setVideos((prev) => prev.filter((v) => v.id !== id));
+    setVideos((prev) => {
+      const filtered = prev.filter((v) => v.id !== id);
+      if (typeof window !== "undefined") {
+        try {
+          localStorage.setItem(CACHED_FEED_KEY, JSON.stringify(filtered));
+        } catch (e) {}
+      }
+      return filtered;
+    });
 
     // 2. Call backend API delete endpoint
     await deleteVideoFromApi(id);
@@ -109,12 +165,15 @@ export function useVideos() {
     setVideos(defaultVideos);
     if (typeof window !== "undefined") {
       localStorage.removeItem(LOCAL_STORAGE_KEY);
+      localStorage.removeItem(CACHED_FEED_KEY);
     }
   };
 
   return {
     videos,
     isLoaded,
+    isServerWakingUp,
+    refreshVideos,
     addVideo,
     deleteVideo,
     resetVideos,

@@ -44,35 +44,72 @@ export interface CompleteUploadResponse {
 }
 
 /**
- * Fetch public video list from backend API
+ * Fetch public video list from backend API with automatic retry for server cold starts
  */
-export async function fetchVideosFromApi(): Promise<BackendVideo[] | null> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/videos`, {
-      cache: "no-store",
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (error) {
-    console.warn("Backend API unreachable, falling back to local data:", error);
-    return null;
+export async function fetchVideosFromApi(
+  retries = 3,
+  delayMs = 2500,
+  onRetry?: (attempt: number) => void
+): Promise<BackendVideo[] | null> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/videos`, {
+        cache: "no-store",
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+      // If server returned 502/503/504 (standard during Render cold start container boot)
+      if (res.status >= 500 && attempt < retries) {
+        onRetry?.(attempt);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      return null;
+    } catch (error) {
+      if (attempt < retries) {
+        onRetry?.(attempt);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      console.warn("Backend API unreachable, falling back to local data:", error);
+      return null;
+    }
   }
+  return null;
 }
 
 /**
- * Fetch video details by ID from backend API
+ * Fetch video details by ID from backend API with automatic retry for server cold starts
  */
-export async function fetchVideoByIdFromApi(id: string): Promise<BackendVideo | null> {
-  try {
-    const res = await fetch(`${API_BASE_URL}/videos/${id}`, {
-      cache: "no-store",
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (error) {
-    console.warn(`Backend API unreachable for video ${id}, falling back to local data:`, error);
-    return null;
+export async function fetchVideoByIdFromApi(
+  id: string,
+  retries = 3,
+  delayMs = 2000
+): Promise<BackendVideo | null> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${API_BASE_URL}/videos/${id}`, {
+        cache: "no-store",
+      });
+      if (res.ok) {
+        return await res.json();
+      }
+      if (res.status >= 500 && attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      return null;
+    } catch (error) {
+      if (attempt < retries) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        continue;
+      }
+      console.warn(`Backend API unreachable for video ${id}, falling back to local data:`, error);
+      return null;
+    }
   }
+  return null;
 }
 
 /**

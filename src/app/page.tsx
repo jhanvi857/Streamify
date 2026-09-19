@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react";
 import Header from "@/components/Header";
 import CategoryFilter from "@/components/CategoryFilter";
 import VideoCard from "@/components/VideoCard";
+import VideoCardSkeleton from "@/components/VideoCardSkeleton";
 import Link from "next/link";
 import { useVideos } from "@/hooks/useVideos";
 import { Video } from "@/data/videos";
@@ -21,7 +22,7 @@ const extraMockVideos: Array<{
 }> = [];
 
 export default function Home() {
-  const { videos, isLoaded, deleteVideo } = useVideos();
+  const { videos, isLoaded, isServerWakingUp, refreshVideos, deleteVideo } = useVideos();
   const [activeTab, setActiveTab] = useState<"feed" | "trending" | "my-uploads">("feed");
   const [activeCategory, setActiveCategory] = useState("all");
   const [searchTerm, setSearchTerm] = useState("");
@@ -34,9 +35,9 @@ export default function Home() {
   
   const loaderRef = useRef<HTMLDivElement>(null);
 
-  // Initialize videos once loaded from hook
+  // Initialize videos once loaded from hook or cache
   useEffect(() => {
-    if (isLoaded) {
+    if (isLoaded || videos.length > 0) {
       // Filter default public videos
       const publicVideos = videos.filter(
         (v) => v.visibility === "public" && v.id !== "distributed-pipeline"
@@ -323,15 +324,61 @@ export default function Home() {
 
         {/* Video Grid Section */}
         <section className="flex flex-col gap-4 mt-2">
-          <h2 className="text-xs font-bold uppercase tracking-wider text-gray-500">
-            {activeTab === "my-uploads"
-              ? "My Uploads"
-              : activeTab === "trending"
-              ? "Trending Now"
-              : "Trending Now"}
-          </h2>
+          <div className="flex items-center justify-between">
+            <h2 className="text-xs font-bold uppercase tracking-wider text-gray-500">
+              {activeTab === "my-uploads"
+                ? "My Uploads"
+                : activeTab === "trending"
+                ? "Trending Now"
+                : "Trending Now"}
+            </h2>
 
-          {displayGridList.length === 0 ? (
+            {/* Subtle sync status when refreshing cached data in background */}
+            {isServerWakingUp && displayGridList.length > 0 && (
+              <div className="flex items-center gap-2 text-[11px] font-medium text-gray-400">
+                <div className="h-3 w-3 border-2 border-brand-red border-t-transparent rounded-full animate-spin" />
+                <span>Syncing live backend...</span>
+              </div>
+            )}
+          </div>
+
+          {!isLoaded && displayGridList.length === 0 ? (
+            <div className="flex flex-col gap-5">
+              {/* Cold Start Notice Banner */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 rounded-xl bg-dark-card border border-dark-border/80 shadow-lg">
+                <div className="flex items-center gap-3">
+                  <div className="relative flex h-3 w-3 shrink-0 items-center justify-center">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-brand-red opacity-75" />
+                    <span className="relative inline-flex rounded-full h-2 w-2 bg-brand-red" />
+                  </div>
+                  <div className="flex flex-col">
+                    <span className="text-xs font-semibold text-white tracking-wide">
+                      {isServerWakingUp
+                        ? "Waking up cloud backend (Render free tier spin-up)..."
+                        : "Connecting to video streaming pipeline..."}
+                    </span>
+                    <span className="text-[11px] text-gray-400 mt-0.5">
+                      Cloud instances take 20 to 45 seconds to boot on first request. Feed will populate automatically.
+                    </span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2 self-start sm:self-auto shrink-0 bg-neutral-900/80 px-3 py-1.5 rounded-lg border border-neutral-800">
+                  <div className="h-3.5 w-3.5 border-2 border-brand-red border-t-transparent rounded-full animate-spin" />
+                  <span className="text-[11px] font-mono font-medium text-brand-red">
+                    Booting API...
+                  </span>
+                </div>
+              </div>
+
+              {/* 6-Card Skeleton Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <VideoCardSkeleton key={`skeleton-${i}`} />
+                ))}
+              </div>
+            </div>
+          ) : displayGridList.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 border border-dashed border-dark-border rounded-xl text-center px-4 bg-dark-card/30">
               <svg
                 className="h-12 w-12 text-gray-600 mb-3"
@@ -352,13 +399,23 @@ export default function Home() {
                   ? "You haven't uploaded any videos yet. Click the upload button to simulate a video streaming pipeline!"
                   : "No videos match your search query or category filters."}
               </p>
-              {activeTab === "my-uploads" && (
+              {activeTab === "my-uploads" ? (
                 <Link
                   href="/upload"
                   className="mt-4 bg-brand-red hover:bg-brand-red-hover text-white text-xs font-bold px-4 py-2 rounded-lg transition-colors"
                 >
                   Go to upload simulator
                 </Link>
+              ) : (
+                <button
+                  onClick={() => refreshVideos()}
+                  className="mt-4 inline-flex items-center gap-2 bg-neutral-800 hover:bg-neutral-700 text-gray-200 text-xs font-semibold px-4 py-2 rounded-lg transition-colors border border-dark-border cursor-pointer"
+                >
+                  <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                  </svg>
+                  <span>Retry Connection</span>
+                </button>
               )}
             </div>
           ) : (
